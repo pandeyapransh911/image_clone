@@ -1,0 +1,1450 @@
+//! Turning the roots on the command line into the list of files to analyse.
+//! The roots are the paths named, plus any read from a list — `--from-file`,
+//! or `-` for stdin — one a line, or NUL-separated under `-0`; a listed path
+//! is exactly a named one from then on.
+//!
+//! A root that is a file is taken whatever it is called: naming it is asking
+//! for it. A root that is a directory is walked — the images directly inside
+//! it, or everything below it under `-r` — and a walk has to *guess* which of
+//! its files are images, which is what `-x` is for.
+//!
+//! **What comes back is one path per set of bytes, not one per name.** Files
+//! are deduplicated on (device, inode), because this tool's first pass groups
+//! byte-identical files, and two names for one file are byte-identical by
+//! construction: a symlink and its target, two hard links, two overlapping
+//! roots, a path typed twice. Reading both would report a duplicate pair that
+//! is really one file, and deleting either "copy" frees nothing. Which name is
+//! kept is decided in [`settle`], and it is not simply the first.
+//!
+//! **Symlinks met during a walk are not followed unless `--follow-symlinks`
+//! asks.** A path *named* on the command line is followed either way. Under
+//! the flag a link to a file is that file and a link to a directory is walked,
+//! a link back into a folder already being walked is a loop and is skipped
+//! (everything behind it is being walked already, so nothing is missing), and a
+//! link to nothing is a skip, said as one: it is the shape of a link into a
+//! drive that is not mounted, so it stops `--prune-cache`, but a library with
+//! one link to an unplugged drive is not a scan that went wrong, and it made
+//! every run exit 2. (A root named outright that leads nowhere is still a
+//! problem: a mistyped path.)
+//!
+//! **`--exclude` is about bytes, not spellings.** It takes a folder or a file,
+//! and applies to a root named outright as much as to anything a walk finds.
+//! Both sides of the comparison are canonical, because that is the only name
+//! every route to a file agrees on: under `--follow-symlinks`,
+//! `scan/linkdir/a.jpg` and `keep/a.jpg` are the same file and share not one
+//! path component, so a test against the path the walk spelled could never
+//! fire — and it fails in both directions, since excluding the link path the
+//! user can see in the report canonicalizes into the real folder and matches
+//! nothing either. `vid-fp` shipped exactly that bug and paid for it with a
+//! deleted file; see `is_excluded_target` in its `sources.rs`. What it costs
+//! is kept off the default path: a walk that follows no links produces paths
+//! whose canonical form is the root's plus what follows it, so only a walk
+//! that follows links ever asks the filesystem where a path leads.
+//!
+//! **An `--exclude` holding `*`, `?` or `[` that names no path is a pattern**
+//! (`Pattern`): with no `/`, of a folder's or file's name, met anywhere below
+//! a root (`-e '@eaDir'`, `-e '*.tmp.jpg'`); with one, of a path, made
+//! absolute against the current folder, its leading plain part canonical,
+//! and matched against the canonical path of what the walk meets and every
+//! folder above it, `*` within one name and `**` across any number. A
+//! pattern used to be an unresolved path, which excluded nothing and was a
+//! problem.
+
+use crate::extensions::Wanted;
+use crate::problems::{Note, Problems};
+use anyhow::Context;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+/// Everything about the request that decides which files are analysed.
+pub struct Request<'a> {
+    pub roots: &'a [PathBuf],
+    /// `--against`: the library the roots are compared with. Walked by the
+    /// same rules, and each file it lists is marked as the library's.
+    pub library: &'a [PathBuf],
+    pub exclude: &'a [PathBuf],
+    pub wanted: &'a Wanted,
+    pub recursive: bool,
+    pub follow_symlinks: bool,
+    /// `--hidden`: go into folders whose names start with a dot.
+    pub hidden: bool,
+}
+
+/// What one set of bytes is known by: its device and inode.
+#[derive(PartialEq, Eq, Hash)]
+struct Identity(u64, u64);
+
+fn identity(meta: &std::fs::Metadata) -> Identity {
+    use std::os::unix::fs::MetadataExt;
+    Identity(meta.dev(), meta.ino())
+}
+
+/// A name the walk offered, before the names for one file are settled.
+struct Found {
+    path: PathBuf,
+    /// Its canonical path, when the walk knows it without asking; see
+    /// [`walk`].
+    canon: Option<PathBuf>,
+    id: Identity,
+    /// The entry itself is a symlink — not merely reached through a linked
+    /// folder, which names the file just as well. See [`settle`].
+    link: bool,
+    /// Reached from a `--against` root rather than from a root to scan.
+    library: bool,
+    /// How deep the root it was reached from is: its canonical path's
+    /// components. See [`settle`].
+    depth: usize,
+    stat: Stat,
+}
+
+/// What the walk's own `stat` of a file says, kept for the stages after it.
+///
+/// The walk has to read every file's metadata — its identity is how two names
+/// for one file are told apart — and the size and times come with it. The
+/// exact pass, the cache, the header probe and the report each asked the
+/// filesystem for them again, three of them on one thread: four calls a file
+/// on a cached run where one is needed. Through a link, as everywhere here,
+/// they are the target's.
+#[derive(Clone, Copy, Debug)]
+pub struct Stat {
+    pub len: u64,
+    /// `None` when the file's times cannot make one (nanoseconds past what an
+    /// `i64` holds); such a file is not cached.
+    pub key: Option<crate::cache::Key>,
+}
+
+impl Stat {
+    fn of(meta: &std::fs::Metadata) -> Stat {
+        Stat { len: meta.len(), key: crate::cache::key_from(meta) }
+    }
+}
+
+/// Every file a walk lists, in order, with what is known about each.
+pub struct Listing {
+    pub files: Vec<PathBuf>,
+    /// Each file's canonical path when the walk knows it; see [`walk`].
+    pub canonical: Vec<Option<PathBuf>>,
+    pub stats: Vec<Stat>,
+    /// Whether each file is the library's (`Request::library`). A file both
+    /// sides reach is the side's whose root is nearer it: see [`settle`].
+    pub library: Vec<bool>,
+}
+
+/// Every file the request reaches, one path per set of bytes, sorted — and
+/// beside each, its canonical path when the walk already knows it.
+///
+/// **It nearly always does, and the cache wants it for every file.** A record
+/// is kept under the file's canonical path (`lib::cache_names`), and asking
+/// the filesystem for one is a `readlink` per component of the path: seven
+/// failed calls a file in a folder six deep, which were half of every
+/// filesystem call a cached run made, and a round trip each on a network
+/// share. But a root is canonicalized here anyway, and a walk that follows no
+/// links descends only real directories, so below a root the canonical path is
+/// the root's plus what follows it. Only a walk under `--follow-symlinks` says
+/// `None`, and the caller asks the filesystem then.
+///
+/// Everything it passes over it counts, in one of two senses that must not be
+/// confused. What it cannot *read* is a problem: a root that does not exist, a
+/// directory refused part-way through. What it was never going to read is a
+/// skip: a link to nothing under `--follow-symlinks`, a file `-x`
+/// does not take, a symlink it does not follow, a loop, a second name for a
+/// file already listed, a root `--exclude` covers. None of the skips touches
+/// the exit code — which is the whole reason the summary keeps two lists.
+pub fn walk(req: &Request, problems: &mut Problems) -> Listing {
+    let excludes = resolve_excludes(req.exclude, problems);
+    let set_aside = SetAside::here();
+    let levels = if req.recursive { usize::MAX } else { 1 };
+    let mut found = Vec::new();
+    let sides = req.roots.iter().map(|r| (r, false)).chain(req.library.iter().map(|r| (r, true)));
+    for (root, library) in sides {
+        let shown = root.display().to_string();
+        // A root that is not there, or a link to nothing, is loud: a mistyped
+        // path must not be a run that quietly scans one directory of the two
+        // it was given.
+        let (meta, canon) = match std::fs::metadata(root).and_then(|m| Ok((m, std::fs::canonicalize(root)?))) {
+            Ok(found) => found,
+            Err(e) => {
+                problems.note(Note::Unscannable, format_args!("{shown}: {e}"));
+                continue;
+            }
+        };
+        // A library is what the scan is compared with, and an exclude
+        // that holds all of it would leave nothing to compare with: the
+        // way to keep a library inside a scanned folder out of the scan was
+        // `-e`, and it took the library with it, so every file scanned was
+        // `new`. What an exclude holds of a library *below* its root is still
+        // left out. A file both sides reach is settled in [`settle`].
+        let excludes = if library { excludes.sparing(&canon) } else { excludes.clone() };
+        if is_excluded(&canon, &excludes) || !library && meta.is_file() && excludes.names(root) {
+            problems.note(Note::Excluded, &shown);
+            continue;
+        }
+        let depth = canon.components().count();
+        if meta.is_file() {
+            let link = std::fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink());
+            found.push(Found {
+                id: identity(&meta),
+                stat: Stat::of(&meta),
+                path: root.clone(),
+                canon: Some(canon),
+                link,
+                library,
+                depth,
+            });
+        } else if meta.is_dir() {
+            let side = Side { library, depth };
+            walk_dir(root, &canon, levels, side, req, &excludes, &set_aside, &mut found, problems);
+        } else {
+            // A socket, a fifo, a device node: naming one is a mistake worth
+            // hearing about rather than a file worth trying to decode.
+            problems.note(Note::Unscannable, format_args!("{shown}: not a file or a folder"));
+        }
+    }
+    settle(found, problems)
+}
+
+/// Which side a root is on, and how deep it is; see [`Found`].
+#[derive(Clone, Copy)]
+struct Side {
+    library: bool,
+    depth: usize,
+}
+
+fn walk_dir(
+    root: &Path,
+    canon: &Path,
+    levels: usize,
+    side: Side,
+    req: &Request,
+    excludes: &Excludes,
+    set_aside: &SetAside,
+    found: &mut Vec<Found>,
+    problems: &mut Problems,
+) {
+    let follow = req.follow_symlinks;
+    // Folders passed over for what they are, said once the walk is done: the
+    // filter below cannot reach `problems`, which the loop is using.
+    let passed_over = std::cell::RefCell::new(Vec::new());
+    // The path's canonical form when no link lies between it and the root,
+    // which without `--follow-symlinks` is always: the root was canonicalized
+    // and every component below it is a real directory the walk descended.
+    let beneath = |p: &Path| canon.join(p.strip_prefix(root).unwrap_or(p));
+    // A directory is tested where the walk meets it, so an excluded subtree
+    // is pruned whole rather than rejected file by file. Without the flag a
+    // link to a directory is a symlink entry, not a directory, and is skipped
+    // below before anything is asked of it.
+    let entries = WalkDir::new(root)
+        .follow_links(follow)
+        .max_depth(levels)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 || !e.file_type().is_dir() {
+                return true;
+            }
+            if set_aside.holds(e.path(), &beneath(e.path()), follow) {
+                passed_over.borrow_mut().push((e.path().to_path_buf(), true));
+                return false;
+            }
+            if !req.hidden && is_hidden(e.path()) {
+                passed_over.borrow_mut().push((e.path().to_path_buf(), false));
+                return false;
+            }
+            !excludes.names(e.path()) && !leads_into(e.path(), &beneath(e.path()), excludes, follow)
+        });
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                let at = e.path().unwrap_or(root).display().to_string();
+                if e.loop_ancestor().is_some() {
+                    problems.note(Note::SymlinkLoop, &at);
+                } else if leads_nowhere(&e) {
+                    problems.note(Note::BrokenLink, &at);
+                } else {
+                    problems.note(Note::Unscannable, format_args!("{at}: {e}"));
+                }
+                continue;
+            }
+        };
+        // Under `--follow-symlinks` this is the target's type, so a link is
+        // only ever seen here when links are not being followed.
+        let kind = entry.file_type();
+        if kind.is_symlink() {
+            problems.note(Note::Symlink, entry.path().display());
+            continue;
+        }
+        // A folder at the depth the walk stops at is one it will not go
+        // into: only without `--recursive`, whose depth has no end.
+        if kind.is_dir() && entry.depth() > 0 && entry.depth() == levels {
+            problems.note(Note::Subfolder, entry.path().display());
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        if !req.wanted.accepts(entry.path()) {
+            problems.note(Note::NotAnImage, entry.path().display());
+            continue;
+        }
+        // Again for the file itself, which is what catches a link to a file
+        // under an excluded folder, and an `--exclude` naming one file. Not
+        // counted: `excluded` says "named", a file the walk found was not, and
+        // an excluded subtree pruned above contributes nothing to any count
+        // however many files are behind it.
+        if excludes.names(entry.path()) || leads_into(entry.path(), &beneath(entry.path()), excludes, follow) {
+            continue;
+        }
+        // One stat, after the filters have thinned the list: it follows a
+        // followed link, so the identity is the target's.
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                problems.note(Note::Unscannable, format_args!("{}: {}", entry.path().display(), e));
+                continue;
+            }
+        };
+        found.push(Found {
+            id: identity(&meta),
+            stat: Stat::of(&meta),
+            link: entry.path_is_symlink(),
+            canon: (!follow).then(|| beneath(entry.path())),
+            library: side.library,
+            depth: side.depth,
+            path: entry.into_path(),
+        });
+    }
+    for (dir, trash) in passed_over.into_inner() {
+        if trash {
+            problems.note(Note::SetAside, dir.display());
+        } else {
+            problems.note(Note::Hidden, dir.display());
+        }
+    }
+}
+
+/// Whether a folder met during a walk is hidden: its name starts with a dot.
+///
+/// **They are passed over unless `--hidden` asks**, because what a home
+/// folder keeps in them is the programs' own pictures, not the user's: on
+/// the author's machine some 19,000 images under `.steam`, `.local/share`
+/// (icon themes), `.themes` and `.vscode`, every copy of a theme's icons a
+/// group, every one offered for the Trash by a window whose scans are
+/// recursive. A hidden folder named as a root is scanned, as a Trash is.
+fn is_hidden(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    dir.file_name().is_some_and(|n| n.as_bytes().first() == Some(&b'.'))
+}
+
+/// The user's XDG folder `var` (`$XDG_DATA_HOME`, `$XDG_CACHE_HOME`, ...), or
+/// `~/under_home` when it is not set, as the desktop has it.
+///
+/// Inside a Flatpak these variables name the app's own folders under
+/// `~/.var/app/<id>`, not the desktop's: the Trash the file manager empties
+/// and the thumbnail cache it fills are where the host's variables say
+/// (`$HOST_XDG_DATA_HOME`, which Flatpak sets only when the host had it) or
+/// at the defaults under the home folder, which is the same in both.
+pub fn desktop_dir(var: &str, under_home: &str) -> Option<PathBuf> {
+    user_dir(&|k: &str| std::env::var_os(k), sandboxed(), var, under_home)
+}
+
+/// Whether this process runs inside a Flatpak, which puts `/.flatpak-info`
+/// at the root of every sandbox.
+fn sandboxed() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
+fn user_dir(env: &dyn Fn(&str) -> Option<std::ffi::OsString>, sandboxed: bool, var: &str, under_home: &str) -> Option<PathBuf> {
+    let set = if sandboxed { env(&format!("HOST_{var}")) } else { env(var) };
+    set.map(PathBuf::from).filter(|p| p.is_absolute()).or_else(|| env("HOME").map(|h| PathBuf::from(h).join(under_home)))
+}
+
+/// Folders a walk does not go into, because what is in them is not the
+/// library: a Trash, and a thumbnail cache. (And, unless `--hidden` asks,
+/// any hidden folder; see `is_hidden`. These are set aside even then.)
+///
+/// **Both are copies of pictures that are somewhere else, or were.** A Trash
+/// holds the files a person already decided to throw away — the window moves
+/// duplicates to it — so walking it found every one of them again, and since
+/// a group is headed by the lowest path and `.Trash-1000` sorts before nearly
+/// everything, the copy in the Trash became the group's reference and the
+/// live file the "duplicate" to delete. A thumbnail cache is a small copy of
+/// every picture the desktop has shown, and is the same trap with a smaller
+/// picture.
+///
+/// By name, the ones a removable drive or a home folder carries: the
+/// freedesktop topdir trashes (`.Trash`, `.Trash-1000`), macOS's `.Trashes`,
+/// Windows's `$RECYCLE.BIN` and `RECYCLER`, the old `.thumbnails`, and the
+/// folders a NAS keeps on each share — Synology's `#recycle`, `@eaDir` (a
+/// thumbnail of every photo beside it) and `#snapshot`, QNAP's `@Recycle`,
+/// `@__thumb` and `@Recently-Snapshot`: a recycle bin's copy became a group's
+/// KEEP and the live file its DELETE, exactly as a Trash's did; fsck's
+/// `lost+found` (see `holds`); and by
+/// place, the home Trash and thumbnail cache under the XDG folders, whose own
+/// names (`Trash`, `thumbnails`) are too ordinary to go by. Only a folder met
+/// during a walk is passed over. Named as a root, it is scanned like any
+/// other — that is the way to look inside one — and it is listed among the
+/// skips, so a run that passed one over says so.
+struct SetAside {
+    /// Canonical paths of the home Trash and thumbnail cache, where they exist.
+    places: Vec<PathBuf>,
+}
+
+impl SetAside {
+    fn here() -> SetAside {
+        let env = |k: &str| std::env::var_os(k);
+        // The desktop's, and inside a Flatpak the app's own as well (its
+        // `$XDG_DATA_HOME` is under `~/.var/app`, and a scan of the home
+        // folder walks into it); outside one they are the same folder.
+        let mut places: Vec<PathBuf> = [false, true]
+            .into_iter()
+            .flat_map(|desktop| {
+                let sandboxed = desktop && sandboxed();
+                [user_dir(&env, sandboxed, "XDG_DATA_HOME", ".local/share").map(|d| d.join("Trash")), user_dir(&env, sandboxed, "XDG_CACHE_HOME", ".cache").map(|d| d.join("thumbnails"))]
+            })
+            .flatten()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .collect();
+        places.sort();
+        places.dedup();
+        SetAside { places }
+    }
+
+    /// Whether a directory the walk has met is one of them. `canonical_guess`
+    /// is its canonical path when no link led here, as in `leads_into`.
+    fn holds(&self, path: &Path, canonical_guess: &Path, through_links: bool) -> bool {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if name == ".trash" || name.starts_with(".trash-") || name == ".trashes" || name == "$recycle.bin" || name == "recycler" || name == ".thumbnails" {
+            return true;
+        }
+        // A NAS's own, on its shares: Synology's recycle bin, thumbnail and
+        // metadata folders and snapshot view, and QNAP's recycle bin,
+        // thumbnails and snapshot view.
+        if matches!(name.as_str(), "#recycle" | "@eadir" | "#snapshot" | "@recycle" | "@__thumb" | "@recently-snapshot") {
+            return true;
+        }
+        // fsck's: at the root of every ext2/3/4 filesystem, root's alone and
+        // unreadable to anyone else, so a walk of a drive met it as a folder
+        // it could not open — a problem, exit 2, and `--prune-cache`
+        // refused, on every scan of every such drive. What it holds is
+        // fragments fsck recovered, not the library.
+        if name == "lost+found" {
+            return true;
+        }
+        if self.places.is_empty() {
+            return false;
+        }
+        if self.places.iter().any(|p| p == canonical_guess) {
+            return true;
+        }
+        through_links && std::fs::canonicalize(path).is_ok_and(|real| self.places.contains(&real))
+    }
+}
+
+/// One name per set of bytes, and which one.
+///
+/// **A real name is preferred to a symlink, whatever the order.** `vid-fp`
+/// took the first name the walk offered, so a folder holding `a.mp4` and a
+/// link to it offered two names in readdir order — the link could win, and a
+/// user deleting the "duplicate" the report named removed a shortcut and
+/// freed nothing. Here the preference is the same and the order is not even
+/// readdir's: between two equally good names (two hard links, two links, a
+/// file and the same file through a linked folder) the smaller path wins,
+/// which makes the list, and so the run, independent of directory order.
+///
+/// **A file both sides reach is the side's whose root is nearer it**, and
+/// the scan's when the two are as near. An import folder inside the library
+/// (`-r ~/Pictures/inbox --against ~/Pictures`) is the scan's: each of its
+/// files would otherwise be a library file and in the library already. A
+/// library inside the folder scanned (`-r ~/Photos --against
+/// ~/Photos/archive`) is the library: it was the scan's, the library held
+/// nothing, and every file scanned was `new`, a copy of an archived one too.
+/// A file named outright is nearer than any folder holding it. That comes
+/// before the preference for a real name.
+///
+/// Exactly one name is counted per collision either way.
+fn settle(mut found: Vec<Found>, problems: &mut Problems) -> Listing {
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    // One name per set of bytes, and where each set is in it. A name keeps its
+    // own canonical path: two hard links are one file under two of them.
+    let mut kept: Vec<Found> = Vec::with_capacity(found.len());
+    let mut held: HashMap<(u64, u64), usize> = HashMap::with_capacity(found.len());
+    for f in found {
+        let id = (f.id.0, f.id.1);
+        let Some(&at) = held.get(&id) else {
+            held.insert(id, kept.len());
+            kept.push(f);
+            continue;
+        };
+        let wins = |f: &Found, k: &Found| match f.library == k.library {
+            true => !f.link && k.link,
+            false => (f.depth, !f.library) > (k.depth, !k.library),
+        };
+        let dropped = if wins(&f, &kept[at]) { std::mem::replace(&mut kept[at], f).path } else { f.path };
+        problems.note(Note::ListedTwice, dropped.display());
+    }
+    // A later real name may have displaced an earlier link.
+    kept.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut out = Listing {
+        files: Vec::with_capacity(kept.len()),
+        canonical: Vec::with_capacity(kept.len()),
+        stats: Vec::with_capacity(kept.len()),
+        library: Vec::with_capacity(kept.len()),
+    };
+    for f in kept {
+        out.files.push(f.path);
+        out.canonical.push(f.canon);
+        out.stats.push(f.stat);
+        out.library.push(f.library);
+    }
+    out
+}
+
+/// Canonicalize the `--exclude` list, so the prefix test is a test of bytes.
+///
+/// A path that will not resolve excludes nothing, and that is a problem rather
+/// than a detail: `vid-fp` once swallowed it, so a typo in `-e` scanned the
+/// folder the user was protecting.
+fn resolve_excludes(requested: &[PathBuf], problems: &mut Problems) -> Excludes {
+    let mut excludes = Excludes::default();
+    for p in requested {
+        match std::fs::canonicalize(p) {
+            Ok(real) => excludes.paths.push(real),
+            Err(_) if Pattern::is_one(p) => {
+                let pat = Pattern::of(p);
+                if pat.of_name { excludes.names.push(pat) } else { excludes.patterns.push(pat) }
+            }
+            Err(e) => problems.note(Note::UnresolvedExclude, format_args!("{}: {}", p.display(), e)),
+        }
+    }
+    excludes
+}
+
+/// What `--exclude` leaves out: folders and files by their canonical path,
+/// and patterns (`Pattern`) of a path or of a name.
+#[derive(Clone, Default)]
+struct Excludes {
+    paths: Vec<PathBuf>,
+    patterns: Vec<Pattern>,
+    names: Vec<Pattern>,
+}
+
+impl Excludes {
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.patterns.is_empty() && self.names.is_empty()
+    }
+
+    /// These, less what would hold the whole of a library rooted at `canon`.
+    fn sparing(&self, canon: &Path) -> Excludes {
+        Excludes {
+            paths: self.paths.iter().filter(|ex| !canon.starts_with(ex)).cloned().collect(),
+            patterns: self.patterns.iter().filter(|p| !canon.ancestors().any(|a| p.matches(a))).cloned().collect(),
+            names: self.names.clone(),
+        }
+    }
+
+    /// Whether a name pattern covers `path`'s own name: asked of what the walk
+    /// meets, never of the folders above a root.
+    fn names(&self, path: &Path) -> bool {
+        !self.names.is_empty() && path.file_name().is_some_and(|n| self.names.iter().any(|p| p.matches(Path::new(n))))
+    }
+}
+
+/// Component-wise, so `-e photos/take` is not `photos/take2.jpg`; a path
+/// pattern, of the path or any folder above it.
+fn is_excluded(path: &Path, excludes: &Excludes) -> bool {
+    excludes.paths.iter().any(|ex| path.starts_with(ex)) || !excludes.patterns.is_empty() && path.ancestors().any(|a| excludes.patterns.iter().any(|p| p.matches(a)))
+}
+
+/// Whether a walk's error is a followed link whose target is not there.
+fn leads_nowhere(e: &walkdir::Error) -> bool {
+    e.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        && e.path().is_some_and(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
+}
+
+/// An `--exclude` pattern: `*` any run of bytes within a name, `?` one byte,
+/// `[...]` one of a set (`[!...]` or `[^...]` none of it, `a-z` a range), and
+/// `**` as a whole name any number of names. Bytes, as a path is.
+#[derive(Clone, Debug)]
+struct Pattern {
+    /// The pattern's names; for a path pattern from the root, absolute.
+    parts: Vec<Vec<u8>>,
+    /// Of a name alone: it held no `/`.
+    of_name: bool,
+}
+
+impl Pattern {
+    /// Whether `p` is meant as a pattern: it holds a wildcard.
+    fn is_one(p: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        p.as_os_str().as_bytes().iter().any(|b| matches!(b, b'*' | b'?' | b'['))
+    }
+
+    fn of(p: &Path) -> Pattern {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = p.as_os_str().as_bytes();
+        if !bytes.contains(&b'/') {
+            return Pattern { parts: vec![bytes.to_vec()], of_name: true };
+        }
+        // Absolute, and its plain lead canonical where it resolves, so that it
+        // is compared with canonical paths in their own terms.
+        let p = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let names: Vec<&std::ffi::OsStr> = p.iter().collect();
+        let plain = names.iter().take_while(|n| !Pattern::is_one(Path::new(n))).count();
+        let lead: PathBuf = names[..plain].iter().collect();
+        let lead = std::fs::canonicalize(&lead).unwrap_or(lead);
+        let mut parts: Vec<Vec<u8>> = lead.iter().map(|n| n.as_bytes().to_vec()).collect();
+        parts.extend(names[plain..].iter().map(|n| n.as_bytes().to_vec()));
+        Pattern { parts, of_name: false }
+    }
+
+    /// Whether `path` (a name, for a name pattern; else an absolute path) is
+    /// what the pattern says, whole.
+    fn matches(&self, path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let names: Vec<&[u8]> = path.iter().map(|n| n.as_bytes()).collect();
+        let pat: Vec<&[u8]> = self.parts.iter().map(Vec::as_slice).collect();
+        names_match(&pat, &names)
+    }
+}
+
+/// Names against a path pattern's names, `**` any run of names. In linear
+/// time, as `name_matches` is within a name.
+fn names_match(pat: &[&[u8]], names: &[&[u8]]) -> bool {
+    stars_match(pat.len(), names.len(), |i| pat[i] == b"**", |i, j| name_matches(pat[i], names[j]).then_some(i + 1))
+}
+
+/// One name against one name's pattern.
+///
+/// A star is tried only from the last one met: whatever an earlier star could
+/// take instead, the last can as well, since a star takes any run. Trying
+/// every split point at every star was exponential in the stars when nothing
+/// matched (`*a*a*a*a*a*a*a*a*a*a*b` against a 60-byte name ran for minutes,
+/// once for every file met).
+fn name_matches(p: &[u8], n: &[u8]) -> bool {
+    stars_match(p.len(), n.len(), |i| p[i] == b'*', |i, j| one_byte(p, i, n[j]))
+}
+
+/// The one matcher under both: a pattern of `len_p` tokens, of which `star(i)`
+/// takes any run and the rest one each (`one(i, j)`: whether token `i` takes
+/// item `j`, and where the pattern goes on), against `len_n` items.
+fn stars_match(len_p: usize, len_n: usize, star: impl Fn(usize) -> bool, one: impl Fn(usize, usize) -> Option<usize>) -> bool {
+    let (mut i, mut j) = (0, 0);
+    // After the last star met: where the pattern goes on, and the item it
+    // was last taken up to.
+    let mut back: Option<(usize, usize)> = None;
+    loop {
+        if i < len_p && star(i) {
+            i += 1;
+            back = Some((i, j));
+            continue;
+        }
+        if j < len_n {
+            if i < len_p
+                && let Some(next) = one(i, j)
+            {
+                i = next;
+                j += 1;
+                continue;
+            }
+        } else if i == len_p {
+            return true;
+        }
+        match back {
+            Some((bi, bj)) if bj < len_n => {
+                back = Some((bi, bj + 1));
+                (i, j) = (bi, bj + 1);
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether the token at `p[i]` (not a star) takes byte `c`, and where the
+/// pattern goes on.
+fn one_byte(p: &[u8], i: usize, c: u8) -> Option<usize> {
+    match p[i] {
+        b'?' => Some(i + 1),
+        b'[' => match set_end(&p[i + 1..]) {
+            Some(end) => in_set(&p[i + 1..i + 1 + end], c).then_some(i + end + 2),
+            // An unclosed `[` is itself.
+            None => (c == b'[').then_some(i + 1),
+        },
+        b => (b == c).then_some(i + 1),
+    }
+}
+
+/// Where a set's `]` is, after its first member (`[]a]` holds `]`).
+fn set_end(s: &[u8]) -> Option<usize> {
+    let skip = usize::from(matches!(s.first(), Some(b'!' | b'^')));
+    (skip + 1..s.len()).find(|&i| s[i] == b']').filter(|_| s.len() > skip)
+}
+
+fn in_set(set: &[u8], c: u8) -> bool {
+    let (negated, set) = match set.split_first() {
+        Some((b'!' | b'^', rest)) => (true, rest),
+        _ => (false, set),
+    };
+    let mut hit = false;
+    let mut i = 0;
+    while i < set.len() {
+        if i + 2 < set.len() && set[i + 1] == b'-' {
+            hit |= (set[i]..=set[i + 2]).contains(&c);
+            i += 3;
+        } else {
+            hit |= set[i] == c;
+            i += 1;
+        }
+    }
+    hit != negated
+}
+
+/// Is this walk path, or what it leads to, under an `--exclude`?
+///
+/// `canonical_guess` answers when no link was followed to get here; a walk
+/// that follows links asks the filesystem, which is the one case where the
+/// guess can be wrong. A path that will not canonicalize is not excluded, and
+/// needs no protecting: it cannot be opened, so it cannot be analysed.
+fn leads_into(path: &Path, canonical_guess: &Path, excludes: &Excludes, through_links: bool) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    if is_excluded(canonical_guess, excludes) {
+        return true;
+    }
+    through_links && std::fs::canonicalize(path).is_ok_and(|real| is_excluded(&real, excludes))
+}
+
+/// Where the roots come from: the command line, and the lists it points at.
+pub struct Sources<'a> {
+    /// The positional paths. `-` among them reads a list from stdin.
+    pub named: &'a [PathBuf],
+    /// `--from-file`: a list of paths, `-` for stdin.
+    pub from_file: Option<&'a Path>,
+    /// `-0`: the lists are NUL-separated rather than one path a line.
+    pub null_separated: bool,
+}
+
+/// Every root the user asked for, with `-` and `--from-file` expanded, and
+/// where each list came from with how many paths it held, for the header.
+///
+/// Stdin is read at most once however many times it is asked for: `img-fp - -`,
+/// or `-` with `--from-file -`, is a typo rather than a request to read the
+/// pipe twice. A list that cannot be opened or read is fatal — it is the whole
+/// of what the run was asked to scan, and a run over nothing would exit 0.
+pub fn requested_roots(sources: &Sources) -> anyhow::Result<(Vec<PathBuf>, Vec<(String, usize)>)> {
+    let stdin = Path::new("-");
+    let mut roots = Vec::new();
+    let mut lists = Vec::new();
+    let mut stdin_taken = false;
+    let mut take_stdin = |roots: &mut Vec<PathBuf>, lists: &mut Vec<(String, usize)>| -> anyhow::Result<()> {
+        if std::mem::replace(&mut stdin_taken, true) {
+            return Ok(());
+        }
+        let paths = read_stdin(sources.null_separated)?;
+        lists.push(("stdin".to_string(), paths.len()));
+        roots.extend(paths);
+        Ok(())
+    };
+    for path in sources.named {
+        if path == stdin {
+            take_stdin(&mut roots, &mut lists)?;
+        } else {
+            roots.push(path.clone());
+        }
+    }
+    if let Some(list) = sources.from_file {
+        if list == stdin {
+            take_stdin(&mut roots, &mut lists)?;
+        } else {
+            let file = std::fs::File::open(list)
+                .with_context(|| format!("could not open the path list {}", list.display()))?;
+            let paths = read_path_list(file, sources.null_separated)
+                .with_context(|| format!("could not read the path list {}", list.display()))?;
+            lists.push((list.display().to_string(), paths.len()));
+            roots.extend(paths);
+        }
+    }
+    Ok((roots, lists))
+}
+
+fn read_stdin(null_separated: bool) -> anyhow::Result<Vec<PathBuf>> {
+    use std::io::IsTerminal;
+    // Without this, `img-fp -` at a prompt looks exactly like a hang.
+    if std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "asked to read paths from stdin, but stdin is a terminal. \
+             Pipe a list in (e.g. `fd -e jpg | img-fp -`), or name folders as arguments."
+        );
+    }
+    read_path_list(std::io::stdin().lock(), null_separated).context("could not read the path list from stdin")
+}
+
+/// Read a whole path list.
+///
+/// Read as bytes, and on Unix a path is its bytes: a filename that is not
+/// UTF-8 is still a filename, and the roots are paths rather than strings, so
+/// nothing here has to turn one away. (`vid-fp` holds its paths as strings and
+/// skips such an entry; img-fp never had to.)
+fn read_path_list<R: std::io::Read>(mut reader: R, null_separated: bool) -> std::io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut raw = Vec::new();
+    reader.read_to_end(&mut raw)?;
+    Ok(split_path_list(&raw, null_separated).into_iter().map(|entry| PathBuf::from(std::ffi::OsStr::from_bytes(entry))).collect())
+}
+
+/// Split a list on newlines, or on NUL bytes when asked. Blank entries are
+/// dropped.
+///
+/// A trailing carriage return is trimmed in newline mode. A list authored on
+/// Windows would otherwise fail every single path with "No such file", and the
+/// byte responsible is invisible in the message — the worst kind of failure to
+/// debug. `-0` exists for anyone who needs the bytes untouched, and it is the
+/// only way to pass a filename containing a newline.
+fn split_path_list(raw: &[u8], null_separated: bool) -> Vec<&[u8]> {
+    let separator = if null_separated { b'\0' } else { b'\n' };
+    raw.split(|&b| b == separator)
+        .map(|entry| if null_separated { entry } else { entry.strip_suffix(b"\r").unwrap_or(entry) })
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Whether an `--exclude` entry is a pattern when it names no path: it holds
+/// `*`, `?` or `[` (`Pattern`). For a window, which shows the two apart.
+pub fn is_exclude_pattern(p: &Path) -> bool {
+    Pattern::is_one(p)
+}
+
+/// What a window makes of an exclusion typed by hand: the `--exclude` entry
+/// to pass, `None` for nothing typed, or why it is not one.
+///
+/// **A window has no current folder to resolve against**, where a shell does:
+/// a relative `photos/**/raw` would be read against wherever the window was
+/// started, which excludes nothing and says so only as a problem after the
+/// scan. So a path, plain or a pattern, is a whole one, or starts `~/`
+/// (`home`, as a shell expands it); and a pattern of names alone (no `/`:
+/// `*.tmp`, `Thumb?`) is taken as typed, since it is matched below every
+/// folder scanned. A bare name with no wildcard is refused rather than
+/// guessed at: on the command line it is a path.
+pub fn typed_exclude(text: &str, home: Option<&Path>) -> Result<Option<PathBuf>, &'static str> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let p = match (t.strip_prefix('~'), home) {
+        (Some(""), Some(h)) => h.to_path_buf(),
+        (Some(rest), Some(h)) if rest.starts_with('/') => h.join(rest.trim_start_matches('/')),
+        _ => PathBuf::from(t),
+    };
+    if p.is_absolute() {
+        return Ok(Some(p));
+    }
+    if is_exclude_pattern(&p) && !t.contains('/') {
+        return Ok(Some(p));
+    }
+    Err(if is_exclude_pattern(&p) {
+        "A pattern holding a / needs a whole path, such as ~/Pictures/**/raw."
+    } else {
+        "A folder or file needs its whole path. To leave out a name wherever it is, use * or ?, such as *.tmp."
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::problems::Log;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    /// What a window may pass as `--exclude`: whole paths, `~/` ones, and
+    /// patterns of names; never a path the worker would resolve against a
+    /// folder nobody chose.
+    #[test]
+    fn a_typed_exclusion_is_a_whole_path_or_a_pattern_of_names() {
+        let home = Path::new("/home/u");
+        let ok = |t: &str| typed_exclude(t, Some(home)).unwrap().unwrap();
+        assert_eq!(ok("*.tmp"), PathBuf::from("*.tmp"));
+        assert_eq!(ok("  @eaDi?  "), PathBuf::from("@eaDi?"), "trimmed");
+        assert_eq!(ok("/srv/photos/**/raw"), PathBuf::from("/srv/photos/**/raw"));
+        assert_eq!(ok("/srv/photos/edits"), PathBuf::from("/srv/photos/edits"));
+        assert_eq!(ok("~/Pictures/**/raw"), PathBuf::from("/home/u/Pictures/**/raw"));
+        assert_eq!(ok("~"), PathBuf::from("/home/u"));
+        assert_eq!(typed_exclude("   ", Some(home)), Ok(None));
+        assert!(typed_exclude("photos/**/raw", Some(home)).is_err(), "relative to nothing");
+        assert!(typed_exclude("@eaDir", Some(home)).is_err(), "a bare name is a relative path");
+        assert!(typed_exclude("~/x", None).is_err(), "no home to expand");
+        assert!(typed_exclude("~bob/x", Some(home)).is_err(), "another user's home is not expanded");
+        // What it hands on is what the walk reads as the same kind of entry.
+        assert!(is_exclude_pattern(&ok("*.tmp")) && !is_exclude_pattern(&ok("/srv/photos/edits")));
+    }
+
+    /// A directory that removes itself, since the crate has no `tempfile`.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Scratch {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("img-fp-walk-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            // Canonical, so the expected paths below compare equal to the
+            // walked ones on a machine whose temp dir is itself a link.
+            Scratch(fs::canonicalize(&p).unwrap())
+        }
+
+        fn dir(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        fn file(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, rel.as_bytes()).unwrap();
+            p
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Run {
+        files: Vec<PathBuf>,
+        problems: usize,
+        walk_complete: bool,
+    }
+
+    /// Which side each file a scan `--against` a library is on: the side's
+    /// whose root is nearer it, the scan's when they are as near; and an
+    /// exclude holding a whole library leaves it be.
+    #[test]
+    fn a_file_both_sides_reach_is_the_nearer_roots() {
+        let s = Scratch::new();
+        let (inbox, archive) = (s.file("inbox/x.jpg"), s.file("archive/x.jpg"));
+        let named = s.file("archive/named.jpg");
+        let (wanted, _) = crate::extensions::normalize(&["jpg".to_string()]).unwrap();
+        let sides = |roots: &[PathBuf], library: &[PathBuf], exclude: &[PathBuf]| {
+            let log = Log::default();
+            let mut problems = Problems::new(&log);
+            let req = Request { roots, library, exclude, wanted: &wanted, recursive: true, follow_symlinks: false, hidden: false };
+            let l = walk(&req, &mut problems);
+            l.files.into_iter().zip(l.library).collect::<Vec<_>>()
+        };
+        let all = [(named.clone(), true), (archive.clone(), true), (inbox.clone(), false)];
+        // A library inside the folder scanned.
+        assert_eq!(sides(&[s.0.clone()], &[s.dir("archive")], &[]), all);
+        // An exclude of it, the way to keep it out of the scan, keeps it in
+        // the library.
+        assert_eq!(sides(&[s.0.clone()], &[s.dir("archive")], &[s.dir("archive")]), all);
+        // An import folder inside the library.
+        assert_eq!(sides(&[s.dir("inbox")], &[s.0.clone()], &[]), all.clone().map(|(p, _)| (p.clone(), p != inbox)));
+        // The same folder both ways, and a file named outright inside the
+        // library: the scan's.
+        assert!(sides(&[s.0.clone()], &[s.0.clone()], &[]).iter().all(|(_, lib)| !lib));
+        assert_eq!(sides(&[named.clone()], &[s.0.clone()], &[]), all.clone().map(|(p, _)| (p.clone(), p != named)));
+    }
+
+    fn run(roots: &[PathBuf], exclude: &[PathBuf], recursive: bool, follow: bool) -> Run {
+        run_hidden(roots, exclude, recursive, follow, false)
+    }
+
+    fn run_hidden(roots: &[PathBuf], exclude: &[PathBuf], recursive: bool, follow: bool, hidden: bool) -> Run {
+        let (wanted, _) = crate::extensions::normalize(&["jpg".to_string()]).unwrap();
+        let log = Log::default();
+        let mut problems = Problems::new(&log);
+        let Listing { files, canonical: canon, stats, .. } = walk(
+            &Request {
+                roots,
+                library: &[],
+                exclude,
+                wanted: &wanted,
+                recursive,
+                follow_symlinks: follow,
+                hidden,
+            },
+            &mut problems,
+        );
+        // And every size it states is the one the filesystem gives.
+        for (f, st) in files.iter().zip(&stats) {
+            assert_eq!(st.len, fs::metadata(f).unwrap().len(), "{}", f.display());
+        }
+        // Every canonical path the walk states is the one the filesystem
+        // gives, whatever the case under test.
+        for (f, c) in files.iter().zip(&canon) {
+            if let Some(c) = c {
+                assert_eq!(Some(c), fs::canonicalize(f).ok().as_ref(), "{}", f.display());
+            }
+        }
+        if !follow {
+            assert!(canon.iter().all(Option::is_some), "a walk that follows no links knows every canonical path");
+        }
+        Run {
+            files,
+            problems: problems.count(),
+            walk_complete: problems.walk_was_complete(),
+        }
+    }
+
+    /// A root spelled through `.` and `..`, and named as a file, gives the
+    /// canonical paths the filesystem gives; `run` checks them.
+    #[test]
+    fn the_canonical_paths_a_walk_states_are_the_filesystems() {
+        let s = Scratch::new();
+        let a = s.file("scan/sub/a.jpg");
+        s.file("scan/b.jpg");
+        let odd = s.0.join("scan/./sub/../sub/..");
+        assert_eq!(run(&[odd.clone()], &[], true, false).files.len(), 2);
+        assert_eq!(run(&[odd.join("sub/a.jpg")], &[], false, false).files, vec![odd.join("sub/a.jpg")]);
+        assert_eq!(fs::canonicalize(odd.join("sub/a.jpg")).unwrap(), a);
+    }
+
+    #[test]
+    fn a_symlink_is_not_followed_unless_asked() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        let b = s.file("elsewhere/b.jpg");
+        symlink(s.0.join("elsewhere"), s.0.join("scan/linkdir")).unwrap();
+        symlink(&b, s.0.join("scan/link.jpg")).unwrap();
+        let roots = [s.0.join("scan")];
+
+        assert_eq!(run(&roots, &[], true, false).files, vec![a.clone()]);
+        // Both links lead to `b`, which is one file and is listed once, under
+        // the name that is not itself a link.
+        assert_eq!(run(&roots, &[], true, true).files, vec![a, s.0.join("scan/linkdir/b.jpg")]);
+    }
+
+    /// A walk does not go into a Trash or a thumbnail cache, by name or by
+    /// place, and scans one that is named as a root.
+    /// A hidden folder is passed over during a walk unless `--hidden` asks,
+    /// and scanned when it is named; a hidden *file* is a file like another.
+    /// A Trash is set aside either way.
+    #[test]
+    fn a_hidden_folder_waits_for_hidden() {
+        let s = Scratch::new();
+        let a = s.file("home/Pictures/a.jpg");
+        let dot = s.file("home/Pictures/.b.jpg");
+        let icon = s.file("home/.local/share/icons/c.jpg");
+        let deep = s.file("home/Pictures/.git/d.jpg");
+        s.file("home/.Trash-1000/files/e.jpg");
+        let home = s.0.join("home");
+        assert_eq!(run(&[home.clone()], &[], true, false).files, vec![dot.clone(), a.clone()]);
+        let mut all = vec![icon.clone(), deep.clone(), dot.clone(), a.clone()];
+        all.sort();
+        assert_eq!(run_hidden(&[home.clone()], &[], true, false, true).files, all);
+        // Named, it is scanned without the flag.
+        assert_eq!(run(&[s.0.join("home/.local")], &[], true, false).files, vec![icon]);
+    }
+
+    #[test]
+    fn a_trash_or_thumbnail_cache_is_passed_over() {
+        let s = Scratch::new();
+        let a = s.file("drive/photos/a.jpg");
+        for rel in [".Trash-1000/files/a.jpg", ".Trash/1000/files/b.jpg", "$RECYCLE.BIN/S-1-5/c.jpg", ".Trashes/501/d.jpg", "photos/.thumbnails/e.jpg"] {
+            s.file(&format!("drive/{rel}"));
+        }
+        // A folder only an ordinary name says nothing about.
+        for rel in ["#recycle/g.jpg", "photos/@eaDir/a.jpg/SYNOPHOTO_THUMB_M.jpg", "#snapshot/h.jpg", "@Recycle/i.jpg", "@__thumb/j.jpg", "@Recently-Snapshot/k.jpg"] {
+            s.file(&format!("drive/{rel}"));
+        }
+        let kept = s.file("drive/trash-talk/f.jpg");
+        // fsck's, root's alone on a real drive: not a folder it failed to read.
+        s.file("drive/lost+found/#1234");
+        let lost = s.dir("drive/lost+found");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lost, fs::Permissions::from_mode(0o000)).unwrap();
+        let r = run(&[s.0.join("drive")], &[], true, false);
+        fs::set_permissions(&lost, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(r.files, vec![a.clone(), kept.clone()]);
+        assert_eq!(r.problems, 0, "lost+found is set aside, not a folder that would not open");
+        assert!(r.walk_complete);
+        // Named, it is scanned.
+        let t = s.0.join("drive/.Trash-1000");
+        assert_eq!(run(&[t.clone()], &[], true, false).files, vec![t.join("files/a.jpg")]);
+
+        // The home Trash and thumbnail cache, by where they are.
+        let set = SetAside { places: vec![s.dir("home/.local/share/Trash"), s.dir("home/.cache/thumbnails")] };
+        for p in &set.places {
+            assert!(set.holds(p, p, false));
+        }
+        let other = s.dir("home/Pictures/thumbnails");
+        assert!(!set.holds(&other, &other, false), "a folder of that name elsewhere is a folder");
+    }
+
+    #[test]
+    fn inside_a_flatpak_the_desktops_folders_are_the_hosts() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(v));
+        let sandbox = vars(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/home/u/.var/app/x/data")]);
+        assert_eq!(user_dir(&sandbox, false, "XDG_DATA_HOME", ".local/share"), Some(PathBuf::from("/home/u/.var/app/x/data")), "the app's own");
+        assert_eq!(user_dir(&sandbox, true, "XDG_DATA_HOME", ".local/share"), Some(PathBuf::from("/home/u/.local/share")), "the desktop's default");
+        let host_set = vars(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/home/u/.var/app/x/data"), ("HOST_XDG_DATA_HOME", "/data/u")]);
+        assert_eq!(user_dir(&host_set, true, "XDG_DATA_HOME", ".local/share"), Some(PathBuf::from("/data/u")), "the host's own setting");
+        let relative = vars(&[("HOME", "/home/u"), ("XDG_CACHE_HOME", "cache")]);
+        assert_eq!(user_dir(&relative, false, "XDG_CACHE_HOME", ".cache"), Some(PathBuf::from("/home/u/.cache")), "a relative path is ignored, as the spec says");
+    }
+
+    #[test]
+    fn a_link_and_its_target_are_one_file_not_a_duplicate_pair() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        // Named so that the link sorts first: the order that lost in vid-fp.
+        symlink(&a, s.0.join("scan/0-link.jpg")).unwrap();
+        let r = run(&[s.0.join("scan")], &[], false, true);
+        assert_eq!(r.files, vec![a], "the real name, however the names sort");
+        assert_eq!(r.problems, 0, "a second name is a skip");
+    }
+
+    #[test]
+    fn a_named_link_does_not_stand_in_for_the_file_a_walk_finds() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        let link = s.0.join("0-link.jpg");
+        symlink(&a, &link).unwrap();
+        // Followed because it was named, and then settled against the walk:
+        // without identity it was a byte-identical "pair" of one file.
+        let r = run(&[link.clone(), s.0.join("scan")], &[], false, false);
+        assert_eq!(r.files, vec![a]);
+        // Alone, it is the only name there is and it is kept.
+        assert_eq!(run(&[link.clone()], &[], false, false).files, vec![link]);
+    }
+
+    #[test]
+    fn hard_links_and_overlapping_roots_are_listed_once() {
+        let s = Scratch::new();
+        let a = s.file("scan/sub/a.jpg");
+        fs::hard_link(&a, s.0.join("scan/b.jpg")).unwrap();
+        let r = run(&[s.0.join("scan"), s.0.join("scan/sub"), a.clone()], &[], true, false);
+        assert_eq!(r.files, vec![s.0.join("scan/b.jpg")], "the smaller of two equally real names");
+    }
+
+    #[test]
+    fn an_import_folder_inside_the_library_is_the_scans() {
+        let s = Scratch::new();
+        let shelf = s.file("lib/old.jpg");
+        let fresh = s.file("lib/import/new.jpg");
+        // A hard link under the library, with a smaller path, still loses to
+        // the scan's name for the same file.
+        fs::hard_link(&fresh, s.0.join("lib/a.jpg")).unwrap();
+        let (wanted, _) = crate::extensions::normalize(&["jpg".to_string()]).unwrap();
+        let log = Log::default();
+        let mut problems = Problems::new(&log);
+        let roots = [s.0.join("lib/import")];
+        let library = [s.0.join("lib")];
+        let l = walk(
+            &Request { roots: &roots, library: &library, exclude: &[], wanted: &wanted, recursive: true, follow_symlinks: false, hidden: false },
+            &mut problems,
+        );
+        let got: Vec<(PathBuf, bool)> = l.files.into_iter().zip(l.library).collect();
+        assert_eq!(got, vec![(fresh, false), (shelf, true)]);
+    }
+
+    #[test]
+    fn a_symlink_loop_is_a_skip_and_everything_else_is_still_found() {
+        let s = Scratch::new();
+        let a = s.file("scan/sub/a.jpg");
+        symlink(s.0.join("scan"), s.0.join("scan/sub/up")).unwrap();
+        let r = run(&[s.0.join("scan")], &[], true, true);
+        assert_eq!(r.files, vec![a]);
+        assert_eq!(r.problems, 0, "nothing behind a loop is missing");
+        assert!(r.walk_complete);
+    }
+
+    #[test]
+    fn a_dangling_link_is_a_skip_when_followed_and_stops_a_prune() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        symlink(s.0.join("unmounted/drive"), s.0.join("scan/photos")).unwrap();
+        let followed = run(&[s.0.join("scan")], &[], true, true);
+        assert_eq!(followed.files, vec![a.clone()]);
+        assert_eq!(followed.problems, 0, "a link to an unplugged drive is no failed scan");
+        assert!(!followed.walk_complete, "--prune-cache must not prune against it");
+        let not_followed = run(&[s.0.join("scan")], &[], true, false);
+        assert_eq!((not_followed.files, not_followed.problems), (vec![a], 0));
+    }
+
+    #[test]
+    fn an_exclude_prunes_a_folder_and_can_name_one_file() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        s.file("scan/keep/b.jpg");
+        let c = s.file("scan/c.jpg");
+        let r = run(&[s.0.join("scan")], &[s.0.join("scan/keep"), c], true, false);
+        assert_eq!(r.files, vec![a]);
+        assert_eq!(r.problems, 0);
+    }
+
+    #[test]
+    fn an_exclude_matches_whole_components() {
+        let s = Scratch::new();
+        let take = s.file("scan/take.jpg");
+        s.file("scan/take/x.jpg");
+        let r = run(&[s.0.join("scan")], &[s.0.join("scan/take")], true, false);
+        assert_eq!(r.files, vec![take]);
+    }
+
+    #[test]
+    fn an_exclude_outranks_a_root_named_outright() {
+        let s = Scratch::new();
+        let a = s.file("keep/a.jpg");
+        let r = run(&[a.clone(), s.0.join("keep")], &[s.0.join("keep")], false, false);
+        assert!(r.files.is_empty());
+        assert_eq!(r.problems, 0, "doing what it was told is not a failure");
+    }
+
+    #[test]
+    fn an_exclude_holds_for_relative_roots_and_relative_excludes() {
+        // Roots are never canonicalized for the report, so the walk spells
+        // `scan/keep/b.jpg` wherever the exclude resolved to.
+        let s = Scratch::new();
+        s.file("scan/a.jpg");
+        s.file("scan/keep/b.jpg");
+        let here = std::env::current_dir().unwrap();
+        let rel = |p: &Path| pathdiff(p, &here);
+        let r = run(&[rel(&s.0.join("scan"))], &[rel(&s.0.join("scan/./keep"))], true, false);
+        assert_eq!(r.files, vec![rel(&s.0.join("scan/a.jpg"))]);
+    }
+
+    /// `a` relative to `base`, both absolute, through `..` as needed.
+    fn pathdiff(a: &Path, base: &Path) -> PathBuf {
+        let a: Vec<_> = a.components().collect();
+        let b: Vec<_> = base.components().collect();
+        let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let mut out = PathBuf::new();
+        for _ in common..b.len() {
+            out.push("..");
+        }
+        for c in &a[common..] {
+            out.push(c);
+        }
+        out
+    }
+
+    #[test]
+    fn an_exclude_protects_a_file_reached_through_a_linked_folder() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        s.file("keep/precious.jpg");
+        symlink(s.0.join("keep"), s.0.join("scan/linkdir")).unwrap();
+        let r = run(&[s.0.join("scan")], &[s.0.join("keep")], true, true);
+        assert_eq!(r.files, vec![a]);
+    }
+
+    #[test]
+    fn excluding_the_link_path_works_as_well_as_excluding_the_real_one() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        s.file("keep/precious.jpg");
+        symlink(s.0.join("keep"), s.0.join("scan/linkdir")).unwrap();
+        let r = run(&[s.0.join("scan")], &[s.0.join("scan/linkdir")], true, true);
+        assert_eq!(r.files, vec![a]);
+    }
+
+    #[test]
+    fn an_exclude_protects_a_file_reached_through_a_link_to_it() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        let precious = s.file("keep/precious.jpg");
+        symlink(&precious, s.0.join("scan/link.jpg")).unwrap();
+        let r = run(&[s.0.join("scan")], &[s.0.join("keep")], true, true);
+        assert_eq!(r.files, vec![a]);
+    }
+
+    #[test]
+    fn an_exclude_naming_one_file_reaches_it_through_a_link_too() {
+        let s = Scratch::new();
+        let precious = s.file("elsewhere/precious.jpg");
+        s.file("elsewhere/other.jpg");
+        symlink(s.0.join("elsewhere"), s.dir("scan").join("linkdir")).unwrap();
+        let r = run(&[s.0.join("scan")], &[precious], true, true);
+        assert_eq!(r.files, vec![s.0.join("scan/linkdir/other.jpg")]);
+    }
+
+    /// A pattern of a name leaves out every folder and file of that name
+    /// below a root; a pattern of a path, what lies there; neither is a
+    /// problem.
+    #[test]
+    fn an_exclude_can_be_a_pattern_of_a_name_or_a_path() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        s.file("scan/junk/a.jpg");
+        let b = s.file("scan/sub/junk2/b.jpg");
+        s.file("scan/sub/junk/b.jpg");
+        let c = s.file("scan/sub/c.jpg");
+        s.file("scan/sub/c.tmp.jpg");
+        s.file("scan/skip1/d.jpg");
+        let e = s.file("scan/skip2/deep/e.jpg");
+        let f = s.file("scan/keep/f.jpg");
+        let sorted = |mut v: Vec<PathBuf>| {
+            v.sort();
+            v
+        };
+        let ex = [PathBuf::from("jun?"), PathBuf::from("*.tmp.jpg"), s.0.join("scan/skip[0-9]")];
+        let r = run(&[s.0.join("scan")], &ex, true, false);
+        assert_eq!(sorted(r.files), sorted(vec![a.clone(), b.clone(), c.clone(), f.clone()]));
+        assert_eq!(r.problems, 0);
+        let r = run(&[s.0.join("scan")], &[s.0.join("**/deep"), s.0.join("scan/s*/*.jpg")], true, false);
+        assert_eq!(sorted(r.files), sorted(vec![a, s.0.join("scan/junk/a.jpg"), b, s.0.join("scan/sub/junk/b.jpg"), f]));
+        let _ = e;
+    }
+
+    #[test]
+    fn a_pattern_matches_by_names() {
+        let p = |s: &str| Pattern::of(Path::new(s));
+        let m = |pat: &Pattern, s: &str| pat.matches(Path::new(s));
+        assert!(m(&p("*.jpg"), "a.jpg") && !m(&p("*.jpg"), "a.png") && m(&p("a?c"), "abc") && !m(&p("a?c"), "ac"));
+        assert!(m(&p("[ab]x"), "bx") && !m(&p("[!ab]x"), "bx") && m(&p("[a-c]"), "b") && m(&p("[]]"), "]") && m(&p("[x"), "[x"));
+        assert!(m(&p("/r/*/z"), "/r/y/z") && !m(&p("/r/*/z"), "/r/y/w/z") && m(&p("/r/**/z"), "/r/y/w/z") && m(&p("/r/**/z"), "/r/z"));
+    }
+
+    /// The matcher as first written, every split point at every star tried:
+    /// what a pattern means, held against the linear one.
+    fn names_match_by_trying(pat: &[&[u8]], names: &[&[u8]]) -> bool {
+        match pat.split_first() {
+            None => names.is_empty(),
+            Some((&b"**", rest)) => (0..=names.len()).any(|i| names_match_by_trying(rest, &names[i..])),
+            Some((p, rest)) => names
+                .split_first()
+                .is_some_and(|(n, more)| name_matches_by_trying(p, n) && names_match_by_trying(rest, more)),
+        }
+    }
+
+    fn name_matches_by_trying(p: &[u8], n: &[u8]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((b'*', rest)) => (0..=n.len()).any(|i| name_matches_by_trying(rest, &n[i..])),
+            Some((b'?', rest)) => !n.is_empty() && name_matches_by_trying(rest, &n[1..]),
+            Some((b'[', rest)) => match (set_end(rest), n.split_first()) {
+                (Some(end), Some((&c, more))) => in_set(&rest[..end], c) && name_matches_by_trying(&rest[end + 1..], more),
+                (None, Some((&c, more))) => c == b'[' && name_matches_by_trying(rest, more),
+                (_, None) => false,
+            },
+            Some((&c, rest)) => n.first() == Some(&c) && name_matches_by_trying(rest, &n[1..]),
+        }
+    }
+
+    #[test]
+    fn a_pattern_matches_as_trying_every_split_would() {
+        // Small alphabets, so that stars, sets and literals meet often.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |k: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % k) as usize
+        };
+        const PAT: &[&[u8]] = &[b"a", b"b", b"*", b"?", b"[ab]", b"[!a]", b"[", b"]", b"[a-b]"];
+        let (mut hits, mut misses) = (0, 0);
+        for _ in 0..200_000 {
+            let p: Vec<u8> = (0..next(7)).flat_map(|_| PAT[next(PAT.len() as u64)].iter().copied()).collect();
+            let n: Vec<u8> = (0..next(8)).map(|_| b"ab[]"[next(4)]).collect();
+            let want = name_matches_by_trying(&p, &n);
+            assert_eq!(name_matches(&p, &n), want, "{:?} against {:?}", String::from_utf8_lossy(&p), String::from_utf8_lossy(&n));
+            if want { hits += 1 } else { misses += 1 }
+        }
+        assert!(hits > 10_000 && misses > 10_000, "{hits} {misses}");
+        const NAMES: &[&[u8]] = &[b"**", b"a", b"b", b"*", b"a*"];
+        for _ in 0..100_000 {
+            let p: Vec<&[u8]> = (0..next(6)).map(|_| NAMES[next(NAMES.len() as u64)]).collect();
+            let n: Vec<&[u8]> = (0..next(6)).map(|_| [&b"a"[..], b"b", b"ab"][next(3)]).collect();
+            assert_eq!(names_match(&p, &n), names_match_by_trying(&p, &n), "{p:?} against {n:?}");
+        }
+    }
+
+    #[test]
+    fn a_pattern_of_many_stars_that_fails_fails_at_once() {
+        let name = [b'a'; 60];
+        let t = std::time::Instant::now();
+        assert!(!name_matches(b"*a*a*a*a*a*a*a*a*a*a*b", &name));
+        let names: Vec<&[u8]> = vec![b"a"; 60];
+        assert!(!names_match(&[b"**", b"a", b"**", b"a", b"**", b"a", b"**", b"a", b"**", b"a", b"**", b"b"], &names));
+        assert!(t.elapsed() < std::time::Duration::from_millis(100), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn an_exclude_that_does_not_resolve_is_a_problem() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        let r = run(&[s.0.join("scan")], &[s.0.join("scan/kepe")], false, false);
+        assert_eq!(r.files, vec![a], "it excluded nothing");
+        assert_eq!(r.problems, 1, "and the run says so");
+        assert!(r.walk_complete, "a scan that read more than meant to is still complete");
+    }
+
+    #[test]
+    fn a_missing_root_is_a_problem() {
+        let s = Scratch::new();
+        let r = run(&[s.0.join("nope")], &[], false, false);
+        assert!(r.files.is_empty());
+        assert_eq!(r.problems, 1);
+        assert!(!r.walk_complete);
+    }
+
+    #[test]
+    fn subfolders_and_links_to_them_wait_for_recursive() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        s.file("scan/sub/b.jpg");
+        s.file("elsewhere/c.jpg");
+        symlink(s.0.join("elsewhere"), s.0.join("scan/linkdir")).unwrap();
+        assert_eq!(run(&[s.0.join("scan")], &[], false, true).files, vec![a]);
+    }
+
+    #[test]
+    fn a_list_is_split_on_newlines_and_blanks_are_ignored() {
+        assert_eq!(split_path_list(b"/imgs/a.jpg\n\n/imgs/b.png\n", false), vec![&b"/imgs/a.jpg"[..], &b"/imgs/b.png"[..]]);
+    }
+
+    #[test]
+    fn a_carriage_return_is_trimmed_rather_than_kept_in_the_path() {
+        // A list authored on Windows. Keeping the \r fails every path with "No
+        // such file", and the byte responsible does not show up in the message.
+        assert_eq!(split_path_list(b"/imgs/a.jpg\r\n/imgs/b.png\r\n", false), vec![&b"/imgs/a.jpg"[..], &b"/imgs/b.png"[..]]);
+    }
+
+    #[test]
+    fn a_null_separated_list_keeps_every_byte_of_the_filename() {
+        // The reason -0 exists: both of these are legal Linux filenames.
+        let raw = b"/imgs/two\nlines.jpg\0/imgs/trailing\r.jpg\0";
+        assert_eq!(split_path_list(raw, true), vec![&b"/imgs/two\nlines.jpg"[..], &b"/imgs/trailing\r.jpg"[..]]);
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_still_a_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let paths = read_path_list(&b"/imgs/good.jpg\n/imgs/\xFF\xFEodd.jpg\n"[..], false).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[1].as_os_str().as_bytes(), b"/imgs/\xFF\xFEodd.jpg");
+    }
+
+    #[test]
+    fn a_listed_file_is_walked_as_if_it_were_named() {
+        let s = Scratch::new();
+        let a = s.file("scan/a.jpg");
+        let b = s.file("other/b.jpg");
+        let odd = s.file("other/new\nline.jpg");
+        let list = s.0.join("list");
+        let raw = [a.as_os_str(), s.0.join("other").as_os_str(), odd.as_os_str()]
+            .map(|p| p.to_str().unwrap().to_string())
+            .join("\0");
+        fs::write(&list, raw).unwrap();
+
+        let named = [a.clone()];
+        let (roots, lists) = requested_roots(&Sources { named: &named, from_file: Some(&list), null_separated: true }).unwrap();
+        assert_eq!(lists, vec![(list.display().to_string(), 3)]);
+        // `a` is named and listed: one file, listed once.
+        let mut want = vec![a, b, odd];
+        want.sort();
+        assert_eq!(run(&roots, &[], false, false).files, want);
+    }
+
+    #[test]
+    fn a_list_that_cannot_be_opened_is_fatal() {
+        let missing = Path::new("/nonexistent/img-fp/list");
+        let err = requested_roots(&Sources { named: &[], from_file: Some(missing), null_separated: false });
+        assert!(err.is_err(), "a run over nothing would exit 0 and say nothing was found");
+    }
+}

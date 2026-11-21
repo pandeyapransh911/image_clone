@@ -1,0 +1,356 @@
+# .github/workflows/release.yml
+#
+# Builds a release binary and attaches it to a GitHub Release when you push a
+# version tag (e.g. `git tag v0.7.0 && git push origin v0.7.0`).
+#
+# Everything is pure Rust except HEIC/HEIF/AVIF, which go through the system's
+# libheif, LOADED AT RUN TIME (src/heif.rs) the first time such a file is met,
+# not linked: the binary starts without it, and any libheif from 1.12 serves.
+# A binary asks for the glibc it was linked against, not the one Rust's std
+# needs (2.17): built on this runner (glibc 2.39) the CLI asked for 2.34
+# (`__libc_start_main`, the pthread functions merged into libc then), which
+# left out RHEL 8 and its rebuilds, Debian 11 and Ubuntu 20.04. So the CLI is
+# built in AlmaLinux 8 (the manylinux_2_28 image, glibc 2.28) and the window,
+# which needs GTK 4.10 and so a newer system anyway, here; "Verify the
+# binaries" holds each to its floor.
+#
+# Each release publishes:
+#   img-fp-<version>-x86_64-linux-gnu  -> archival, one per release
+#   img-fp-x86_64-linux-gnu            -> stable name, so this URL always works:
+#     https://github.com/Danielnara24/img-fp/releases/latest/download/img-fp-x86_64-linux-gnu
+#   img-fp-gui-<version>-x86_64-linux-gnu, img-fp-gui-x86_64-linux-gnu
+#                                      -> the window, same two names; it links
+#                                         the system's GTK 4 as well
+#   img-fp-<version>-extras.tar.gz     -> completions, man page, desktop entry
+# plus a .sha256 beside each.
+#
+# The CLI is built WITHOUT the `gui` feature and before the window, so the
+# binary that ships as img-fp never has GTK among its libraries; the check in
+# "Verify the binaries" holds it to that.
+#
+# The same tag also publishes the crate to crates.io (`publish-crate`),
+# gated on the binary build so nothing reaches a registry that cannot take
+# a version back.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create/update the GitHub Release
+
+jobs:
+  build:
+    name: x86_64 Linux binary
+    runs-on: ubuntu-24.04
+    env:
+      # Said outright, though it is the default, so that no RUSTFLAGS in the
+      # runner's environment can make it native: native on a CI runner is
+      # whatever that host happens to be (often AVX-512), and the binary would
+      # die with SIGILL on older users' CPUs. Plain x86-64 runs on every
+      # 64-bit x86 CPU: the hot
+      # loops are compiled twice, once for x86-64-v3 (AVX2 + FMA + BMI2,
+      # Haswell 2013+, every Zen), and the CPU is asked which to run when the
+      # binary starts; see src/simd.rs. It is the build `cargo install` makes
+      # too. Job-wide so Build and Test agree and Test does not rebuild the
+      # binary with different flags.
+      RUSTFLAGS: "-C target-cpu=x86-64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        # `img-fp --version` reports Cargo.toml's version, not the tag's, so a
+        # binary published as v0.8.0 that says 0.7.0 is the drift this catches.
+        # Read out of the [package] section alone, so a dependency's `version`
+        # cannot answer.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
+          if [ -z "$CRATE" ]; then
+            echo "::error::could not read version from Cargo.toml [package]"
+            exit 1
+          fi
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "::error::tag v$TAG does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          # libheif is not needed to build. Its runtime is installed so the
+          # tests and the smoke test below read HEIF through it.
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev pkg-config libheif1 libheif-plugin-libde265 libheif-plugin-dav1d
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        # Same profile and flags as the Build, so the test build reuses its
+        # artifacts and target/release/img-fp is still the binary that ships.
+        # The timing benches are #[ignore]d and do not run here; accuracy is
+        # measured against the local corpus, which is not in the repo.
+        run: |
+          # This build is the one whose x86-64-v3 copies are held to its
+          # portable ones bit for bit by `the_plain_and_the_v3_copies_agree`.
+          cargo test --release --locked
+          # And a build that assumes AVX2, as `target-cpu=native` makes on a
+          # modern machine, where the kernels are compiled in directly.
+          RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=target/v3 cargo test --release --locked --lib
+
+      - name: Build the CLI that ships, on glibc 2.28
+        # The same sources and flags as the Build above, whose binary the
+        # tests ran; only the glibc it is linked against differs. Into a
+        # target folder of its own, owned by the runner's user afterwards.
+        run: |
+          docker run --rm -v "$PWD":/src -w /src -e RUSTFLAGS -e CARGO_TARGET_DIR=/src/target/glibc228 \
+            quay.io/pypa/manylinux_2_28_x86_64 bash -c '
+              curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              . "$HOME/.cargo/env"
+              cargo build --release --locked --bin img-fp'
+          sudo chown -R "$(id -u):$(id -g)" target/glibc228
+          target/glibc228/release/img-fp --version
+
+      - name: Build the window
+        # Only the img-fp-gui target: target/release/img-fp stays the CLI
+        # built above, without the feature. Its tests are the mnemonic-clash
+        # check and the settings -> command line round trip; neither needs a
+        # display.
+        run: |
+          cargo build --release --locked --features gui --bin img-fp-gui
+          cargo test --release --locked --features gui --bin img-fp-gui
+
+      - name: Verify the binaries
+        # The only shared libraries allowed are what a C/C++ toolchain always
+        # brings, plus, for the window, GTK 4 and the libraries it is built
+        # on. Anything else -- libheif linked again, a stray libjxl, libwebp,
+        # libdav1d -- is a dependency no release note tells the user about.
+        # And neither binary asks for a glibc newer than 2.34. The window
+        # once did, through std::process::Command's weak pidfd symbols
+        # (GLIBC_2.39): harmless, but the loader of every older glibc
+        # printed a warning on each start.
+        run: |
+          BASE='libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libstdc\+\+\.so\.6|ld-linux-x86-64\.so\.2'
+          GTK='libgtk-4\.so\.1|libgio-2\.0\.so\.0|libgobject-2\.0\.so\.0|libglib-2\.0\.so\.0|libgmodule-2\.0\.so\.0|libpango-1\.0\.so\.0|libpangocairo-1\.0\.so\.0|libcairo\.so\.2|libcairo-gobject\.so\.2|libgdk_pixbuf-2\.0\.so\.0|libgraphene-1\.0\.so\.0|libharfbuzz\.so\.0'
+          check() {
+            echo "$1 DT_NEEDED:"; objdump -p "$1" | grep NEEDED
+            UNEXPECTED="$(objdump -p "$1" | awk '/NEEDED/ {print $2}' | grep -vE "^($2)\$" || true)"
+            if [ -n "$UNEXPECTED" ]; then
+              echo "::error::unexpected shared library dependency of $1: $UNEXPECTED"
+              exit 1
+            fi
+          }
+          glibc_floor() {
+            NEWEST="$(objdump -T "$1" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+            echo "$1 newest glibc symbol: $NEWEST"
+            if [ "$(printf '%s\nGLIBC_%s\n' "$NEWEST" "$2" | sort -V | tail -1)" != "GLIBC_$2" ]; then
+              echo "::error::$1 needs $NEWEST; the README promises glibc $2"
+              exit 1
+            fi
+          }
+          CLI=target/glibc228/release/img-fp
+          "$CLI" --version
+          # Linked against glibc 2.28, which still kept libdl and libpthread
+          # apart from libc.
+          check "$CLI" "$BASE|libdl\.so\.2|libpthread\.so\.0"
+          glibc_floor "$CLI" 2.28
+          # The binary that ships finds what the tested one finds.
+          mkdir -p "$RUNNER_TEMP/pics"
+          printf 'P5\n64 64\n255\n' > "$RUNNER_TEMP/pics/a.pgm"
+          head -c 4096 /dev/urandom >> "$RUNNER_TEMP/pics/a.pgm"
+          cp "$RUNNER_TEMP/pics/a.pgm" "$RUNNER_TEMP/pics/b.pgm"
+          "$CLI" --no-cache --no-last "$RUNNER_TEMP/pics" -o "$RUNNER_TEMP/old.csv"
+          target/release/img-fp --no-cache --no-last "$RUNNER_TEMP/pics" -o "$RUNNER_TEMP/new.csv"
+          cmp "$RUNNER_TEMP/old.csv" "$RUNNER_TEMP/new.csv"
+          check target/release/img-fp-gui "$BASE|$GTK"
+          glibc_floor target/release/img-fp-gui 2.34
+          # The window's scan runs without a display, so it can be smoke
+          # tested: an empty folder is a clean run that finds nothing.
+          mkdir -p "$RUNNER_TEMP/empty"
+          target/release/img-fp-gui --worker "$RUNNER_TEMP/r.json" img-fp --no-cache -- "$RUNNER_TEMP/empty"
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BIN=target/glibc228/release/img-fp
+          mkdir -p dist
+          # Same binary, two names: a versioned copy for history and a stable
+          # copy so the /releases/latest/download/ URL never changes.
+          cp "$BIN" "dist/img-fp-${VERSION}-x86_64-linux-gnu"
+          cp "$BIN" "dist/img-fp-x86_64-linux-gnu"
+          cp target/release/img-fp-gui "dist/img-fp-gui-${VERSION}-x86_64-linux-gnu"
+          cp target/release/img-fp-gui "dist/img-fp-gui-x86_64-linux-gnu"
+          # Generated by the binary being shipped, so they describe exactly
+          # the flags it has.
+          mkdir -p dist/extras/completions dist/extras/man dist/extras/applications dist/extras/icons
+          "$BIN" --completions bash > dist/extras/completions/img-fp.bash
+          "$BIN" --completions zsh  > dist/extras/completions/_img-fp
+          "$BIN" --completions fish > dist/extras/completions/img-fp.fish
+          "$BIN" --man              > dist/extras/man/img-fp.1
+          cp io.github.danielnara24.img-fp.desktop dist/extras/applications/
+          cp flatpak/io.github.danielnara24.img-fp.svg dist/extras/icons/
+          tar -C dist/extras -czf "dist/img-fp-${VERSION}-extras.tar.gz" completions man applications icons
+          rm -rf dist/extras
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            x86_64 Linux binary.
+
+            ```bash
+            curl -L -o img-fp \
+              https://github.com/Danielnara24/img-fp/releases/latest/download/img-fp-x86_64-linux-gnu
+            chmod +x img-fp && sudo install -m 755 img-fp /usr/local/bin/img-fp
+            ```
+
+            Runs on any x86_64 CPU, and uses AVX2 when the CPU has it. Needs
+            glibc 2.28 or newer (Ubuntu 20.04+, Debian 10+, Fedora 29+,
+            RHEL 8+). HEIC and AVIF files are read through the system's
+            libheif (1.12 or newer) and its decoder plugins when they are
+            installed, for example
+            `sudo apt install libheif1 libheif-plugin-libde265 libheif-plugin-dav1d`;
+            without them those files are reported as problems and every other
+            format works.
+
+            The desktop app, `img-fp-gui`, also needs GTK 4.10 or newer
+            (Ubuntu 24.04+, Debian 13+, Fedora 38+, RHEL 9+, openSUSE Leap
+            15.6+):
+
+            ```bash
+            sudo apt install libgtk-4-1
+            curl -L -o img-fp-gui \
+              https://github.com/Danielnara24/img-fp/releases/latest/download/img-fp-gui-x86_64-linux-gnu
+            chmod +x img-fp-gui && sudo install -m 755 img-fp-gui /usr/local/bin/img-fp-gui
+            ```
+
+            Shell completions (bash, zsh, fish), a man page and the app's
+            desktop entry are in `img-fp-<version>-extras.tar.gz`; see the
+            README for where they go.
+
+  flatpak:
+    name: Flatpak bundle
+    # The desktop app with GTK 4 from the GNOME runtime and libheif bundled,
+    # for distributions whose own GTK is older than 4.10 (Ubuntu 22.04) or
+    # whose libheif has no HEIC decoder. Built from the same manifest as a
+    # local `flatpak-builder` build, offline, from flatpak/cargo-sources.json.
+    # Gated on the binary build, so it ships only what was tested.
+    needs: build
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check cargo-sources.json matches Cargo.lock
+        # A crate in Cargo.lock that the generated sources lack fails the
+        # offline build half an hour in; say which one here instead.
+        run: |
+          python3 - <<'PY'
+          import json, re
+          lock = set(re.findall(r'name = "([^"]+)"\nversion = "([^"]+)"\nsource = "registry', open("Cargo.lock").read()))
+          dests = {s.get("dest", "") for s in json.load(open("flatpak/cargo-sources.json"))}
+          missing = sorted(f"{n}-{v}" for n, v in lock if f"cargo/vendor/{n}-{v}" not in dests)
+          if missing:
+              raise SystemExit("::error::flatpak/cargo-sources.json is out of date; regenerate it from Cargo.lock. Missing: " + ", ".join(missing))
+          PY
+
+      - name: Build
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: img-fp-x86_64.flatpak
+          manifest-path: flatpak/io.github.danielnara24.img-fp.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: false
+
+      - name: Verify the bundle
+        # The window's scan runs without a display, so the installed app can
+        # be smoke tested as the binary is: an empty folder is a clean run.
+        # And libheif must be the bundled one, with its HEVC decoder.
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive img-fp-x86_64.flatpak
+          mkdir -p "$RUNNER_TEMP/empty"
+          flatpak run --command=img-fp io.github.danielnara24.img-fp --version
+          flatpak run --command=img-fp-gui io.github.danielnara24.img-fp --worker /tmp/r.json img-fp --no-cache -- "$RUNNER_TEMP/empty"
+          flatpak run --command=sh io.github.danielnara24.img-fp -c 'ls /app/lib/libheif.so.1 /app/lib/libde265.so*'
+
+      - name: Upload to release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp img-fp-x86_64.flatpak "dist/img-fp-${VERSION}-x86_64.flatpak"
+          cp img-fp-x86_64.flatpak dist/img-fp-x86_64.flatpak
+          cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  publish-crate:
+    name: Publish to crates.io
+    # Gated on the binary build, and deliberately so: a GitHub Release can be
+    # deleted and re-cut, while a crates.io version can only be yanked and its
+    # number is spent for ever. Nothing reaches the registry from a tag that
+    # could not produce a working, tested binary.
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # this job publishes elsewhere; it writes nothing here
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the token is configured
+        # Failing here costs nothing; failing inside `cargo publish` happens
+        # after a full verification build.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add it under" \
+                 "Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Skip if this version is already published
+        # Re-running a release to fix an artifact must not hard-fail on
+        # `crate version already exists`. A version goes up once; every later
+        # run of the same tag is a no-op rather than a red cross. (The tag was
+        # already checked against Cargo.toml in the build job.)
+        id: published
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+                    -H 'User-Agent: img-fp release workflow' \
+                    "https://crates.io/api/v1/crates/img-fp/$VERSION")"
+          if [ "$CODE" = "200" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::img-fp $VERSION is already on crates.io; not publishing again"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.published.outputs.already == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # --locked so the registry gets the dependency versions this release was
+        # tested against, the same flag the build job uses.
+        run: cargo publish --locked

@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.danielnara24.img-fp</id>
+  <name>img-fp</name>
+  <summary>Find duplicate and near-duplicate images</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="io.github.danielnara24">
+    <name>Danielnara24</name>
+  </developer>
+
+  <description>
+    <p>
+      img-fp finds copies of the same picture, even when they are not the same
+      file. It compares images by their local features rather than by one hash
+      of the whole picture, so it still finds a match after an image has been
+      re-encoded, resized, cropped, rotated, recoloured, or placed inside a
+      slide, collage or screenshot. Every match is checked against the pixels
+      before it is shown.
+    </p>
+    <p>It finds:</p>
+    <ul>
+      <li>Exact copies under different names or in different folders</li>
+      <li>The same image saved again at a different size, quality or format</li>
+      <li>Crops, including small ones</li>
+      <li>Rotated, mirrored or colour-adjusted versions</li>
+      <li>An image inside a larger one: a slide, a collage, a page, a screenshot</li>
+    </ul>
+    <p>
+      Pick folders and start the scan, then go through the groups and choose
+      which images to move to the Trash. For each image the scan suggests
+      whether to keep or delete it, never deleting the only copy of what a
+      picture shows; nothing is marked until you ask. A copy can be compared
+      with its group's reference, with the part each shows of the other
+      outlined.
+    </p>
+    <p>
+      JPEG, PNG, GIF, WebP, BMP, TIFF, HEIC, AVIF, JPEG XL and more are read.
+      The command-line tool is included as well:
+      flatpak run --command=img-fp io.github.danielnara24.img-fp --help
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.danielnara24.img-fp.desktop</launchable>
+  <provides>
+    <binary>img-fp</binary>
+    <binary>img-fp-gui</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/Danielnara24/img-fp</url>
+  <url type="bugtracker">https://github.com/Danielnara24/img-fp/issues</url>
+  <url type="vcs-browser">https://github.com/Danielnara24/img-fp</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>One photograph and its copies: resized, cropped, recoloured, and placed in slides</caption>
+      <image>https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/results.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>A mirrored crop beside its reference, with the part they share outlined</caption>
+      <image>https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/compare.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Folders and options, after a scan of 5,460 images</caption>
+      <image>https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/setup.png</image>
+    </screenshot>
+  </screenshots>
+
+  <categories>
+    <category>Graphics</category>
+    <category>Utility</category>
+  </categories>
+  <keywords>
+    <keyword>duplicate</keyword>
+    <keyword>duplicates</keyword>
+    <keyword>images</keyword>
+    <keyword>photos</keyword>
+    <keyword>pictures</keyword>
+  </keywords>
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#9fd3f7</color>
+    <color type="primary" scheme_preference="dark">#1f4e6e</color>
+  </branding>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.86.0" date="2026-11-16">
+      <description>
+        <p>More copies are found by default, as the default bars are a little looser. In a JSON report, files that are identical are listed once as a set rather than as every pair among them.</p>
+      </description>
+    </release>
+    <release version="0.85.0" date="2026-11-13">
+      <description>
+        <p>Suggested deletions are more careful: every one is checked against the file that stays, a picture is not deleted for a much smaller copy, and a collage or slide showing a whole photo at full size can stand in for it. A scan after one with more detail no longer analyses its pictures again.</p>
+      </description>
+    </release>
+    <release version="0.84.1" date="2026-11-09">
+      <description>
+        <p>The progress bar's time left is closer in folders with many copies of each picture.</p>
+      </description>
+    </release>
+    <release version="0.84.0" date="2026-11-09">
+      <description>
+        <p>Every picture is now checked for mirrored and upside-down copies, not only pictures with few copies of their own.</p>
+      </description>
+    </release>
+    <release version="0.83.0" date="2026-11-08">
+      <description>
+        <p>In large folders more copies are found whose shared detail is too little to rank them near the top, at a little more time.</p>
+      </description>
+    </release>
+    <release version="0.82.0" date="2026-11-06">
+      <description>
+        <p>Images are recognised by their content, so moving, renaming or touching files no longer means analysing them again, and identical copies share one analysis. The cache is rebuilt once after the update.</p>
+      </description>
+    </release>
+    <release version="0.81.0" date="2026-11-06">
+      <description>
+        <p>A photo is no longer matched to a small spot of an unrelated picture, and the analysis of every image is made again once, so results agree with a fresh scan.</p>
+      </description>
+    </release>
+    <release version="0.80.0" date="2026-11-04">
+      <description>
+        <p>A slightly cropped copy is no longer suggested for keeping in place of the full picture, two crops that each show a strip the other lacks are both kept, a greatly enlarged copy no longer replaces the original it was made from, and an edited copy no longer leads its group.</p>
+      </description>
+    </release>
+    <release version="0.79.0" date="2026-11-04">
+      <description>
+        <p>Small and enlarged copies of a picture are recognised more often, folders full of identical copies are handled much faster, the window accepts typed patterns for folders to leave out, and files left behind by an interrupted scan are cleaned up.</p>
+      </description>
+    </release>
+    <release version="0.78.1" date="2026-11-04">
+      <description>
+        <p>Leaving folders out by a pattern of many wildcards no longer stalls a scan, the window stays responsive while moving files on a network drive, and deleting files permanently says when no other copy of a picture would be left.</p>
+      </description>
+    </release>
+    <release version="0.78.0" date="2026-11-04">
+      <description>
+        <p>Phone screenshots and their re-encoded copies are now suggested for deletion as other copies are, a backup copy beside an undecided pair is suggested for deletion, folders can be left out by name patterns, and a broken link no longer marks a scan as failed.</p>
+      </description>
+    </release>
+    <release version="0.77.1" date="2026-11-03">
+      <description>
+        <p>Changing the Detail setting no longer analyses every picture again, and a finer Detail costs nothing on pictures too small to show finer detail.</p>
+      </description>
+    </release>
+    <release version="0.77.0" date="2026-11-03">
+      <description>
+        <p>A new Detail setting finds small pictures inside large ones and copies cut from a small part of a photo, taking longer only for pictures large enough to show the finer detail; the old working size setting is gone.</p>
+      </description>
+    </release>
+    <release version="0.76.0" date="2026-10-29">
+      <description>
+        <p>A cut-off copy of a photo is recognised as part of the intact one, an icon file holding several sizes is no longer offered for deletion, a cache setting pointed at another file no longer overwrites it, and caches left by older versions are removed.</p>
+      </description>
+    </release>
+    <release version="0.75.0" date="2026-10-28">
+      <description>
+        <p>Copies of logos, icons and other pictures with little detail are found in folders full of other photos, and a damaged copy of a photo is no longer kept in place of the intact one.</p>
+      </description>
+    </release>
+    <release version="0.74.0" date="2026-10-27">
+      <description>
+        <p>A photo stored sideways with a rotation tag is recognised as the same picture as an upright copy, folders of many copies of one photo are compared much faster, and the Trash no longer takes an image whose kept copy was deleted while the confirmation was open.</p>
+      </description>
+    </release>
+    <release version="0.73.1" date="2026-10-27">
+      <description>
+        <p>Comparing pictures is faster, most of all in folders holding many copies of the same photos. What is found is unchanged.</p>
+      </description>
+    </release>
+    <release version="0.73.0" date="2026-10-26">
+      <description>
+        <p>Two pictures get the same answer whatever else is in the folders being scanned, so a small folder and a whole library agree. Photos that only share a part, such as a distant mountain both show, are no longer grouped together.</p>
+      </description>
+    </release>
+    <release version="0.72.0" date="2026-10-25">
+      <description>
+        <p>Detail added to a plain area, such as a person painted on a wall, now counts when pictures are compared. A rescan no longer reads identical copies again, and the window can reuse a scan made in the terminal.</p>
+      </description>
+    </release>
+    <release version="0.71.0" date="2026-10-24">
+      <description>
+        <p>Motion Photos and pictures with a gain map are kept rather than deleted for their still copy. The cache opens faster, and a rescan where nothing changed skips the matching.</p>
+      </description>
+    </release>
+    <release version="0.70.0" date="2026-10-23">
+      <description>
+        <p>A moved or renamed file is analysed again, so two files can no longer be taken for each other. Of copies with the same pixels, the one with a colour profile, camera details or more colour depth is kept.</p>
+      </description>
+    </release>
+    <release version="0.69.0" date="2026-10-23">
+      <description>
+        <p>Files deleted in another program are noticed before anything is moved to the Trash, and files on drives without a Trash can be deleted permanently. img-fp no longer offers itself as the program that opens folders.</p>
+      </description>
+    </release>
+    <release version="0.68.0" date="2026-10-23">
+      <description>
+        <p>Damaged and empty files are reported with their cause, a library inside the scanned folder is handled, and the large view can show a picture at its actual size.</p>
+      </description>
+    </release>
+    <release version="0.67.0" date="2026-10-22">
+      <description>
+        <p>The progress bar follows the time left, measured as the scan goes.</p>
+      </description>
+    </release>
+  </releases>
+</component>

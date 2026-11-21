@@ -1,0 +1,120 @@
+[package]
+name = "img-fp"
+version = "0.86.0"
+edition = "2024"
+# The oldest compiler the whole crate builds with: the CLI's dependencies
+# (`image`, `jxl-oxide`'s parts) need 1.88, the window's (gtk4 0.11, glib and
+# cairo-rs 0.22) 1.92, and one version is said for both. Said here so that an
+# older one is told so by cargo, rather than failing part-way through a
+# dependency.
+rust-version = "1.92"
+description = "Finds duplicate and near-duplicate images: re-encoded, resized, cropped, rotated, recoloured or embedded"
+authors = ["Danielnara24"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Danielnara24/img-fp"
+readme = "README.md"
+keywords = ["image", "duplicate", "deduplication", "fingerprint", "cli"]
+categories = ["command-line-utilities", "multimedia::images"]
+# CLAUDE.md (one here and in some folders) and HISTORY.md are internal design
+# notes and measurements addressed to a coding agent; they are on
+# GitHub for contributors and have nothing to say to a crate consumer. The
+# Flatpak's manifest, crate list and screenshots (2.8 MB) and the release
+# workflow build from the repository, never from the crate.
+exclude = ["CLAUDE.md", "HISTORY.md", "flatpak/", ".github/"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+# `--completions` and `--man`, generated from the same `Args` the parser
+# reads, so neither can describe a flag the binary does not have.
+clap_complete = "4.6"
+clap_mangen = "0.3"
+flate2 = "1.1.10"
+indicatif = "0.17"
+# The decoders and nothing else. The default set adds `avif`, which is the
+# ravif/rav1e AV1 *encoder* and some sixty crates with it, and nothing here
+# encodes; AVIF is decoded by libheif. Nor `rayon`: all it did here was let
+# the EXR decoder build a thread pool of its own, one thread per core, for
+# every compressed file — eight more threads per EXR whatever `-t` said, and
+# sixty-four with eight workers. Its blocks decompress to the same pixels in
+# order.
+image = { version = "0.25", default-features = false, features = [
+    "bmp", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp",
+] }
+# The decoder `image` itself uses for PNG, asked directly so that a PNG can be
+# read a row at a time into the reduction; see `decode::png::rows`. Kept at the
+# version `image` resolves to, so there is one copy of it in the build.
+png = "0.18"
+# The decoder `image` itself uses for JPEG, asked directly so that a JPEG can
+# be decoded to its luma plane alone; see `decode::jpeg::luma`. Kept at the
+# versions `image` resolves to, so there is one copy of each in the build.
+zune-jpeg = "0.5.15"
+# The decoder `image` itself uses for TIFF, asked directly so that a TIFF can
+# be read a strip or a row of tiles at a time into the reduction; see
+# `decode::tiff::chunks`. Kept at the version `image` resolves to.
+tiff = "0.11.3"
+zune-core = "0.5.3"
+jxl-oxide = "0.12.6"
+# libheif, for HEIC, HEIF and AVIF, is loaded when the first such file is met
+# rather than linked, so that a machine without it scans every other format;
+# see `src/heif.rs`.
+libloading = "0.8"
+# Already in the build through serde_json; finds the markers in a JPEG's image
+# data, to tell a cut-off file from a whole one (`decode::jpeg::cut_off`).
+memchr = "2"
+rayon = "1.12.0"
+# A file's identity in the cache: its content hashed, so a moved, renamed or
+# chmod'ed file keeps its analysis, and so two files of one hash are the same
+# bytes (see `same::exact_groups`). Cryptographic, so no file can be made to
+# collide with another, which a FNV hash once let two pictures do.
+blake3 = "1.8"
+# The cache's index (`cache.rs`): which file is which content, and where each
+# analysis sits in the pack. Built from the bundled source, so no system
+# SQLite is needed or met. The analyses themselves are not in it: measured on
+# 9,000 records, SQLite blobs were 2.7% larger and 3-4x slower to write than
+# the pack's appends.
+rusqlite = { version = "0.41", features = ["bundled"] }
+# A record's three streams (`cache::pack`). On 3,000 records of the found
+# corpus: 2.9% smaller than deflate at its fastest, packed 3.2x and unpacked
+# 4x faster.
+zstd = { version = "0.13", default-features = false }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.151"
+walkdir = "2.5.0"
+# Ctrl-C keeps what the analysis has finished; see `interrupt` in main.rs. The
+# handler runs on a thread of its own rather than in signal context, so it can
+# take a lock and print. "termination" is SIGTERM and SIGHUP as well, as in
+# vid-fp.
+ctrlc = { version = "3.5", features = ["termination"] }
+# `img-fp-gui` only; see `[features]`. GTK is linked from the system, so the
+# window adds little to its own binary and nothing at all to `img-fp`'s.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"], optional = true }
+async-channel = { version = "2.5", optional = true }
+
+[[bin]]
+name = "img-fp"
+path = "src/main.rs"
+
+# The window. It runs the same scan as `img-fp`, in a child process of its own;
+# see `src/gui/scan.rs`.
+[[bin]]
+name = "img-fp-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+# One codegen unit and cross-crate inlining. The pipeline is a handful of tight
+# loops calling into `image`'s decoders and `rayon`; nothing here changes what
+# is computed, only how well it is compiled.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# `--features prof` adds a per-stage CPU-second table to the end of a run. It
+# is what a change to a hot loop is aimed with; see `src/prof.rs`. Without it
+# the `timed!` macro expands to its own argument, so the shipped binary pays
+# nothing for it.
+[features]
+prof = []
+# Builds `img-fp-gui` as well. Off by default, so that `cargo install img-fp`
+# builds the command line alone and needs no GTK to build or to run.
+gui = ["dep:gtk", "dep:async-channel"]

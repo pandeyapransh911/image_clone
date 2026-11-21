@@ -1,0 +1,537 @@
+# img-fp
+
+[![Release](https://img.shields.io/github/v/release/Danielnara24/img-fp?logo=github)](https://github.com/Danielnara24/img-fp/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/img-fp?logo=rust)](https://crates.io/crates/img-fp)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
+**Find duplicate and near-duplicate images on Linux**, from the command line or
+a desktop app, including crops, resizes and pictures pasted into other
+pictures.
+
+`img-fp` compares images by their local features rather than by a single hash of
+the whole picture, so it still finds a match after an image has been
+re-encoded, resized, cropped, rotated, recoloured, or placed inside a slide,
+collage or screenshot. Every match is checked against the pixels before it is
+reported.
+
+## What it finds
+
+- Exact copies under different names or in different folders
+- The same image re-saved at a different size, quality or format
+- Crops, including small ones
+- Rotated, mirrored or colour-adjusted versions
+- An image embedded in a larger one: a slide, a collage, a PDF page, a
+  screenshot
+
+The command line only reports; nothing is moved or deleted. The desktop app
+shows each group and moves the images you choose to the Trash.
+
+## Installation
+
+### Command line
+
+Linux on x86_64 with glibc 2.28 or newer: Ubuntu 20.04+, Debian 10+, Fedora
+29+, Arch, openSUSE Tumbleweed and Leap 15.3+, RHEL 8+ and its rebuilds. It
+runs on any x86_64 CPU and uses AVX2 when the CPU has it (Intel Haswell or
+newer, any AMD Zen).
+
+```bash
+curl -L -o img-fp \
+  https://github.com/Danielnara24/img-fp/releases/latest/download/img-fp-x86_64-linux-gnu
+chmod +x img-fp
+sudo install -m 755 img-fp /usr/local/bin/img-fp
+```
+
+Each release also ships a `.sha256` file if you want to verify the download:
+
+```bash
+sha256sum -c img-fp-x86_64-linux-gnu.sha256
+```
+
+HEIC, HEIF and AVIF files are read through the system's libheif (1.12 or
+newer). Without it those files are reported as unreadable and every other
+format works. To install it with its decoders:
+
+```bash
+sudo apt install libheif1 libheif-plugin-libde265 libheif-plugin-dav1d  # Ubuntu 24.04+, Debian 13+
+sudo apt install libheif1                                               # Ubuntu 22.04, Debian 12
+sudo dnf install libheif                                                # Fedora, RHEL (EPEL)
+sudo pacman -S libheif                                                  # Arch
+sudo zypper install libheif1 libheif-dav1d                              # openSUSE
+```
+
+Fedora, openSUSE and RHEL leave out the HEIC decoder: on Fedora it is
+`libheif-freeworld` from RPM Fusion; on openSUSE, install `libheif1` and
+`libheif-HEIF` from Packman.
+
+### Desktop app: Flatpak
+
+The Flatpak runs on any distribution with Flatpak, Ubuntu 22.04 included, and
+reads HEIC and AVIF files with nothing else installed. Download
+`img-fp-x86_64.flatpak` from the
+[latest release](https://github.com/Danielnara24/img-fp/releases/latest) and
+install it:
+
+```bash
+flatpak install --user img-fp-x86_64.flatpak
+flatpak run io.github.danielnara24.img-fp
+```
+
+Flatpak itself is installed on Fedora, Linux Mint and most other desktops
+already; on Ubuntu, `sudo apt install flatpak` first, then add Flathub as
+[its setup page](https://flathub.org/setup) shows.
+
+The command line comes with it. To start either by its short name from a
+terminal, add these lines to `~/.bashrc` (or your shell's own file):
+
+```bash
+alias img-fp='flatpak run --command=img-fp io.github.danielnara24.img-fp'
+alias img-fp-gui='flatpak run io.github.danielnara24.img-fp'
+```
+
+The Flatpak keeps its cache, settings and last scan in
+`~/.var/app/io.github.danielnara24.img-fp/`, apart from those of an `img-fp`
+installed otherwise.
+
+### Desktop app: binary
+
+The same requirements as the command line, plus GTK 4.10 or newer (Ubuntu
+24.04+, Debian 13+, Fedora 38+, RHEL 9+, openSUSE Tumbleweed and Leap 15.6+,
+Arch):
+
+```bash
+sudo apt install libgtk-4-1          # Ubuntu, Debian
+sudo dnf install gtk4                # Fedora, RHEL 9+
+sudo pacman -S gtk4                  # Arch
+sudo zypper install libgtk-4-1       # openSUSE
+curl -L -o img-fp-gui \
+  https://github.com/Danielnara24/img-fp/releases/latest/download/img-fp-gui-x86_64-linux-gnu
+chmod +x img-fp-gui
+sudo install -m 755 img-fp-gui /usr/local/bin/img-fp-gui
+```
+
+To add it to the applications menu, install the desktop entry and its icon
+from the release's extras archive (`img-fp-<version>-extras.tar.gz`):
+
+```bash
+install -Dm644 applications/io.github.danielnara24.img-fp.desktop \
+  ~/.local/share/applications/io.github.danielnara24.img-fp.desktop
+install -Dm644 icons/io.github.danielnara24.img-fp.svg \
+  ~/.local/share/icons/hicolor/scalable/apps/io.github.danielnara24.img-fp.svg
+```
+
+### From source
+
+Requires the Rust toolchain. The command line alone:
+
+```bash
+cargo install img-fp --locked
+```
+
+With the desktop app, which installs both `img-fp` and `img-fp-gui`:
+
+```bash
+sudo apt install libgtk-4-dev pkg-config                # Ubuntu, Debian
+sudo dnf install gtk4-devel pkgconf-pkg-config         # Fedora, RHEL 10
+sudo pacman -S gtk4 pkgconf                            # Arch
+sudo zypper install gtk4-devel pkg-config              # openSUSE
+cargo install img-fp --locked --features gui
+```
+
+libheif is not needed to build; it is loaded when the first HEIC or AVIF file
+is read, as for the prebuilt binary.
+
+### Shell completions and man page
+
+Each release ships `img-fp-<version>-extras.tar.gz` with completions for bash,
+zsh and fish plus a man page:
+
+```bash
+tar -xzf img-fp-*-extras.tar.gz
+sudo install -Dm644 completions/img-fp.bash /usr/share/bash-completion/completions/img-fp
+sudo install -Dm644 completions/_img-fp     /usr/share/zsh/site-functions/_img-fp
+sudo install -Dm644 completions/img-fp.fish /usr/share/fish/vendor_completions.d/img-fp.fish
+sudo install -Dm644 man/img-fp.1            /usr/share/man/man1/img-fp.1
+```
+
+Without `sudo`, into your home directory (for zsh, use any directory on your
+`fpath`):
+
+```bash
+install -Dm644 completions/img-fp.bash ~/.local/share/bash-completion/completions/img-fp
+install -Dm644 completions/img-fp.fish ~/.config/fish/completions/img-fp.fish
+install -Dm644 man/img-fp.1            ~/.local/share/man/man1/img-fp.1
+```
+
+A source build can generate both itself:
+
+```bash
+img-fp --completions bash | sudo tee /usr/share/bash-completion/completions/img-fp >/dev/null
+img-fp --man | sudo tee /usr/share/man/man1/img-fp.1 >/dev/null
+```
+
+## Usage
+
+```bash
+# Report duplicates in a folder and all its subfolders
+img-fp ~/Pictures -r
+
+# Scan several folders, excluding one
+img-fp ~/Pictures ~/Downloads -e ~/Downloads/keep -r
+
+# Save the report as CSV or JSON
+img-fp ~/Pictures -r -o dupes.csv
+
+# Find more images embedded in slides, screenshots and collages, at some cost in speed
+img-fp ~/Pictures -r --detail 1024
+
+# A quicker, less thorough scan
+img-fp ~/Pictures -r --fast
+```
+
+By default the scan is **not** recursive. Add `-r` to include subfolders. The
+summary at the end counts the subfolders a scan without `-r` passed over.
+
+Individual files can be named alongside folders. A list of paths can be read
+from stdin with `-`, or from a file with `--from-file`:
+
+```bash
+fd -e jpg --changed-within 30d ~/Pictures | img-fp -
+find ~/Pictures -name '*.png' -print0 | img-fp - -0
+img-fp --from-file paths.txt
+```
+
+A file reached through a symlink, a hard link or two overlapping folders is
+scanned once. Symlinks met inside a folder are skipped unless you pass
+`--follow-symlinks`. Trash folders, thumbnail caches, NAS recycle bins and
+snapshot folders, and a drive's `lost+found` are skipped too, since they hold
+copies of pictures that are elsewhere or were deleted; name one directly to
+scan it. Hidden folders (names starting with a dot) are skipped unless you pass
+`--hidden`; a hidden folder named directly is scanned.
+
+`-o` and `--log-file` never write over an image, nor over the list
+`--from-file` reads: naming one is refused before anything runs.
+
+The last scan is kept, so its report can be written again without scanning,
+in another format or with another `--suggest` rule:
+
+```bash
+img-fp --last -o dupes.csv
+img-fp --last --suggest representative
+```
+
+It is kept beside the cache (in `last-scan/`), from the command line or the
+desktop app, whichever finished last, and files deleted since are left out.
+Scans run with `--no-cache` are not kept.
+
+## Output
+
+Each group has one representative, followed by every file that matched it.
+The representative is not necessarily the original.
+
+```
+group_1: 4 files
+	REP,   KEEP,   2000x3000, 2.1MB, /photos/beach.jpg
+	MATCH, DELETE, 2000x3000, 2.1MB, identical, /backup/beach.jpg
+	MATCH, DELETE, 1000x1500, 250.8KB, 43 points, overlap 1.00, correlation 0.99, /phone/beach-crop.jpg
+	MATCH, DELETE, 666x1000, 85.4KB, 172 points, overlap 1.00, correlation 1.00, /phone/beach-small.jpg
+```
+
+- `points`: matching points the two images share
+- `overlap`: how much of one image lies inside the other
+- `correlation`: how closely the pixels of that shared area agree
+
+A match can also be marked `mirrored` or `inverted`.
+
+Every member was checked against the representative, not against the other
+members. A file that matches two representatives appears in both groups.
+
+The second column suggests what to do with each file. img-fp never deletes
+anything itself, and its suggestions can be wrong.
+
+- `KEEP`: the best copy of the picture, a file that shows something the
+  others don't, such as a collage, a slide or a meme made from it, or a
+  different photo that only looks similar
+- `DELETE`: as far as img-fp can tell, everything in it is also in a file
+  marked to stay, at about the same detail or better. This is a suggestion,
+  not a guarantee: an edit that is very hard to tell from the original, such
+  as a faint watermark, a colour change or a heavily re-saved copy, can be
+  the file that stays. Look before deleting anything you cannot replace
+- `REVIEW`: look at it before deciding. Either a close copy, such as one
+  tinted or watermarked, that could not be confirmed, or one of two versions
+  of the same picture, such as a photo and its re-save in another format,
+  where nothing says which one is the original
+
+A file has the same suggestion in every group it appears in. That is the
+default rule, `--suggest content`. Two simpler rules read only the groups:
+
+- `--suggest correlation`: each group's representative is `KEEP`. Another
+  file is `DELETE` when it agrees with a representative closely, from two
+  thirds of the way between `--min-pixel-correlation` and 1 (0.9 by
+  default), `KEEP` when it agrees less, and `REVIEW` below
+  `--min-pixel-correlation`
+- `--suggest representative`: each group's representative is `KEEP` and
+  every other file is `DELETE`
+
+Both can suggest deleting a file that holds something the representative
+doesn't, such as a collage or the uncropped photo.
+
+`-o` picks the format from the file extension (`.txt`, `.csv` or `.json`), and
+`--format` sets it explicitly. CSV has the same rows, `;`-separated, with the
+suggestion in the `action` column. JSON also lists every matched pair. Files
+that are byte-for-byte identical are listed once as a set under `identical`,
+and the pairs name only the first file of each set: every other file of the
+set has the same pairs. The report goes to stdout; progress and the summary go
+to stderr.
+
+## Comparing with a library
+
+To find out which images in a folder you already have, such as a new camera
+import, compare it with your library using `--against`:
+
+```bash
+# Which of these imports do I already have?
+img-fp ~/Downloads/DCIM -r --against ~/Pictures
+
+# Copy only the images the library doesn't have yet
+img-fp ~/Downloads/DCIM -r --against ~/Pictures --list new,better -0 | xargs -0 cp -t ~/Pictures/2026
+```
+
+Instead of groups, each scanned image gets one verdict:
+
+```
+repeat: 2 files
+	REPEAT, 4032x3024, 3.1MB, /DCIM/IMG_0412.jpg
+	        in library: 4032x3024, 2.4MB, 214 points, overlap 1.00, correlation 0.99, /Pictures/2026/beach.jpg
+	REPEAT, 4032x3024, 3.0MB, /DCIM/IMG_0413.jpg
+	        in scan: 4032x3024, 3.1MB, identical, /DCIM/IMG_0412.jpg
+	        which repeats, in library: /Pictures/2026/beach.jpg
+
+better: 1 file
+	BETTER, 4032x3024, 3.3MB, /DCIM/IMG_0420.jpg
+	        in library: 1600x1200, 410.2KB, 96 points, overlap 1.00, correlation 0.98, /Pictures/shared/dog.jpg
+
+new: 1 file
+	NEW,    4032x3024, 2.9MB, /DCIM/IMG_0431.jpg
+```
+
+- `repeat`: you already have it. A file you keep, either in the library or
+  another scanned image, shows all of it at about the same detail or better
+  as far as img-fp can tell, the same suggestion as `DELETE`. When that file is itself a repeat, the last
+  line names the copy at the end of the chain
+- `better`: the library has the picture, but this image shows more of it:
+  it is larger, less cropped, or the original of an edited copy
+- `review`: a weak match to the library, probably an edited copy, such as one
+  tinted or watermarked. Look at it before deciding
+- `new`: the library doesn't have it. An image that could not be read counts
+  as new unless it is byte-identical to a library file
+
+The library's own duplicates are not reported. The library is walked with the
+same options as the scanned folders: add `-r` for one with subfolders. An
+image both reach belongs to the nearer folder: an import folder inside the
+library is scanned, and a library inside the folder scanned is the library.
+`--exclude` leaves out what it covers inside a library, but never a whole
+library.
+
+`--list` prints just the paths with the verdicts you name, one per line (or
+NUL-separated with `-0`), in place of the report. A path holding a line break
+can only be listed with `-0`: without it the run stops with an error rather
+than print it as two lines. The report is still written to `-o` if you name a
+file. The CSV report has a `verdict` column and the file
+it rests on in `match` and `match_in`, and the JSON lists every matched pair
+as well.
+
+`--last` writes the last comparison again, and `--last --list` lists it,
+without comparing again:
+
+```bash
+img-fp --last --list new,better -0 | xargs -0 cp -t ~/Pictures/2026
+```
+
+Images deleted since are left out, a library image deleted since no longer
+counts as one the library has, and a repeat of an image deleted or changed
+since is answered by the rest of the library.
+
+## Desktop app
+
+![The results of a scan: one photograph and its copies](https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/results.png)
+
+`img-fp-gui` is a window over the same scan. Pick folders and options, start
+the scan, then go through the groups and choose which images to move to the
+Trash. Folders given on its command line are the ones to scan
+(`img-fp-gui ~/Pictures`), and a file manager can open a folder with it
+through "Open With Other Application".
+
+Under *Exclude*, add folders to leave out, or type a pattern as `--exclude`
+takes one: a name to leave out wherever it is (`*.tmp`, `Thumb?`), or a whole
+path, which may hold `*` and `**` (`~/Pictures/**/raw`).
+
+- The groups are listed down the left side, each shown by one of its pictures
+  with the number of images in it, and how many are marked once you mark some.
+- A group's images fill the rest of the window. Point at an image, or select
+  it with the arrow keys, to see its name, size, how it matched and what the
+  scan suggests doing with it, in the bar at the bottom. The reference image,
+  the one the others were matched against, is labelled, and weak matches have
+  a yellow corner. The magnifier buttons at the top (or Ctrl+Plus and
+  Ctrl+Minus) make the images larger or smaller, and Ctrl+0 fits the group to
+  the window again.
+- Click the circle on an image, or press Space, to mark it for the Trash.
+  Double click or Enter opens it large. There, *Compare with reference* (or
+  C) shows it beside its group's reference image, with the part each shows
+  of the other outlined and the rest dimmed: where a crop lies in the photo,
+  or a photo in a slide. Arrows on the outline show which way the reference
+  faces, so a turned or mirrored copy is plain to see. *Actual size* (or 1)
+  shows the image pixel for pixel, to tell a sharp copy from a softer one;
+  drag it to move around. Press it again to fit the image to the window.
+  Shift and a click marks or unmarks every image from the last one you
+  marked or unmarked to the one clicked; Shift and an arrow key marks or
+  unmarks each image it moves over the same way.
+- The menu button at the top right, or a right click on an image, opens the
+  image or its folder, marks every other image in the group, or unmarks the
+  group or every group.
+- *Switch to tree view*, in the same menu, lists the scanned folders down the
+  left instead of the groups. Selecting a folder shows every grouped image in
+  it and in its subfolders, and *Mark current folder* marks all of them.
+  *Switch to group view* goes back.
+- *Suggestion rule* switches between the three rules of `--suggest` without
+  scanning again. Nothing is marked for you: *Mark suggested deletions* marks
+  exactly the images suggested for deletion, replacing any marks already made.
+- The Trash button moves the marked images to the Trash, where they can be
+  restored. Images on a drive that has no Trash, such as some network
+  shares, can be deleted permanently instead, after a second question.
+  *Scan settings* goes back to the folders and options, keeping the
+  results.
+- Images deleted or changed in another program while the results are open
+  are noticed before anything is marked or moved: a deleted one leaves its
+  group, and an image suggested for deletion because a deleted or changed
+  one shows all of it becomes `REVIEW`.
+- The results of the last scan are shown again the next time the window
+  opens, with the images you marked still marked and without the images
+  already moved to the Trash. The next scan to finish replaces them,
+  including one run from the command line with the default cache, so a scan
+  run in a terminal can be gone through here.
+
+Every control can be reached from the keyboard. Underlined letters are Alt
+shortcuts, the menu shows its own, and F1 lists every key.
+
+## Options
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `<PATH>...` | Folders and/or image files to scan (required unless `--last`). `-` reads a list of paths from stdin | |
+| `--from-file <FILE>` | Read the paths to scan from a file, one per line (`-` = stdin) | |
+| `-0`, `--null` | Paths in the list are NUL-separated, for `find -print0` / `fd -0`, and so are the paths `--list` prints | off |
+| `-r`, `--recursive` | Include subfolders | off |
+| `-e`, `--exclude <PATH>` | Leave out a folder or file; repeat for several. With `*`, `?` or `[...]` it is a pattern: of a name anywhere (`-e '*.tmp'`) or, holding a `/`, of a path (`-e 'photos/**/raw'`) | |
+| `--follow-symlinks` | Follow symlinks met while walking a folder | off |
+| `--hidden` | Also walk hidden folders, whose names start with a dot | off |
+| `--against <PATH>` | Compare the scanned images with a library of images you already keep, a folder or an image file; repeat for several. Each scanned image gets a verdict instead of a group (see Comparing with a library) | |
+| `--list <VERDICT>` | With `--against`, or `--last` after a comparison with a library, print only the paths of the images with these verdicts, one per line, instead of the report: `repeat`, `better`, `review` or `new`, comma-separated or repeated | |
+| `-x`, `--extensions <EXT>` | Extensions a folder walk treats as images, comma-separated or repeated. `-x '*'` takes every file; an entry starting with `!` is an exception, so `-x '!gif'` takes every file but GIFs. A file with no extension is taken only by those two forms | every supported format |
+| `-o`, `--output <FILE>` | Save the report as `.txt`, `.csv` or `.json`. `-` writes it to stdout | stdout |
+| `--format <FORMAT>` | Write the report as `txt`, `csv` or `json`, whatever `--output` is called | from the extension |
+| `--detail <PX>` | How fine a detail is looked for: `512`, `1024`, `2048` or `4096`. Each step up finds everything the step below finds, and more, mostly small pictures inside large ones and copies cut from a small part of a photo. It is slower, but only for pictures large enough to show the finer detail. At `4096` a large picture takes much memory to analyse, so fewer are analysed at once and the scan takes longer | `512` |
+| `--fast` | Analyse every picture at less detail: about twice as fast, and finds less, mostly small and cropped copies | off |
+| `--min-aligned-points <N>` | Matching points two images must share. Higher is stricter; below 3 behaves as 3. An image that is all of the other, only resized, needs 3 if every part of it agrees | `5` |
+| `--min-frame-overlap <F>` | How much of one image must lie inside the other, from 0 to 1. Higher is stricter | `0.85` |
+| `--min-pixel-correlation <F>` | How closely the pixels of that shared area must agree, from 0 to 1. Higher is stricter | `0.65` |
+| `--skip-mirrored` | Don't search again for mirrored or inverted (negative) copies. Much faster on a library with few duplicates. Misses most mirrored and inverted copies, and a group they linked together can split in two | off |
+| `--suggest <RULE>` | How each file's `KEEP`, `DELETE` or `REVIEW` is decided: `content`, `correlation` or `representative` (see Output) | `content` |
+| `--last` | Write the last scan's report again without scanning, in another format with `-o` or `--format`, or with another `--suggest` rule (see Usage); after a comparison with a library, its verdicts, or with `--list` their paths | |
+| `-t`, `--threads <N>` | Worker threads (`0`, or more than there are cores, = all cores) | `0` |
+| `-v`, `--verbose` | Print timings for each stage | off |
+| `--log-file <PATH>` | Write every skipped file, problem and stage timing to this file. Truncated at the start of each run. `-` writes it to stdout | |
+| `--cache <PATH>` | Use this cache file instead of the default one | `$XDG_CACHE_HOME/img-fp/analysis-IMGFPD01.db` |
+| `--no-cache` | Don't read or write the cache | off |
+| `--clear-cache` | Delete the cache before running | off |
+| `--completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell` and exit | |
+| `--man` | Print the man page (roff) and exit | |
+
+The man page (`man img-fp`, or `img-fp --man`) lists a few more options, for
+tuning and scripting.
+
+Loosening the three `--min-*` options finds more but eventually groups
+different photographs together. The defaults are a safe starting point.
+
+## Formats
+
+JPEG, PNG and APNG, GIF, WebP, BMP, TIFF, AVIF, HEIC/HEIF, JPEG XL, ICO,
+PNM and PAM, TGA, QOI, OpenEXR, Radiance HDR and farbfeld. Files are identified by their content, so a wrong
+extension doesn't matter, but a folder walk only picks up files whose extension
+is in `-x`. Files with no extension are picked up only with `-x '*'` (or an
+exception such as `-x '!gif'`).
+TGA files have no signature and are recognised by the `.tga` extension.
+
+A JPEG or PNG that is cut off, such as an interrupted download, is still
+analysed as far as it goes, and is marked `DAMAGED` in the report. An empty
+file is never an identical copy of another.
+
+An animation (GIF, APNG, WebP, JPEG XL) or a TIFF of several pages is compared
+by its first picture. It is suggested for deletion only when another file
+holds exactly the same bytes, since the rest of its pictures were not
+compared.
+
+Camera raw files (DNG, NEF, ARW, CR2 and the like) are not read, and are
+listed as skipped: their first picture is only the camera's small preview.
+Byte-identical copies of them are still found.
+
+## Cache
+
+The analysis of each image is cached in `$XDG_CACHE_HOME/img-fp/analysis-IMGFPD01.db`
+(or `~/.cache/img-fp/analysis-IMGFPD01.db`) and the files beside it named after
+it, so later runs over the same images are much faster. One cache serves every
+folder you scan and every `--detail` you use.
+
+An image is recognised by its content, so one that is renamed, moved, copied,
+or on a drive mounted at another place keeps its analysis: it is read again to
+recognise it, but not analysed again. The analysis of an image that has been
+deleted, or of a drive that has not been plugged in, is kept for 30 days and
+then dropped. After an upgrade that analyses images differently, images are
+analysed again as they are scanned, and the old analyses are dropped after 30
+days unused.
+Use `--clear-cache` to start over.
+
+An upgrade that changes the cache's format (the part of its name after
+`analysis-`) starts a new cache and deletes the old one. To run two versions
+side by side, give one of them a cache of its own with `--cache`.
+
+Pressing Ctrl-C keeps every image analysed so far.
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Ran clean |
+| `1` | Fatal error; the run did not finish |
+| `2` | Finished, but something failed, such as an image that would not decode. See the `Problems` summary |
+| `130` | Interrupted with Ctrl-C |
+
+## Accuracy on DISC21
+
+[DISC21](https://ai.meta.com/datasets/disc21-dataset/) is the public benchmark
+for image copy detection: 50,000 edited query images to be matched against
+1,000,000 reference photographs, 10,000 of the queries being copies. Scored
+by micro average precision (µAP) on its dev set:
+
+| | µAP |
+| --- | ---: |
+| img-fp, default settings | 63.6 |
+| [SSCD](https://github.com/facebookresearch/sscd-copy-detection) ResNet50, as published | 61.5 |
+| SSCD ResNeXt-101, as published | 63.7 |
+
+img-fp is not trained on anything. SSCD is trained on DISC21's own training
+images, and with score normalization, which img-fp does not have, it reaches
+72.5 and 75.3.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at
+your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+The released binary loads the system's `libheif` (LGPL-3.0) at run time when
+it is installed; it is not bundled. The Flatpak bundles libheif and libde265 (both
+LGPL-3.0), unmodified, as shared libraries.
