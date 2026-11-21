@@ -1,9 +1,5 @@
 # img-fp
 
-[![Release](https://img.shields.io/github/v/release/Danielnara24/img-fp?logo=github)](https://github.com/Danielnara24/img-fp/releases/latest)
-[![crates.io](https://img.shields.io/crates/v/img-fp?logo=rust)](https://crates.io/crates/img-fp)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-
 **Find duplicate and near-duplicate images on Linux**, from the command line or
 a desktop app, including crops, resizes and pictures pasted into other
 pictures.
@@ -69,7 +65,7 @@ Fedora, openSUSE and RHEL leave out the HEIC decoder: on Fedora it is
 The Flatpak runs on any distribution with Flatpak, Ubuntu 22.04 included, and
 reads HEIC and AVIF files with nothing else installed. Download
 `img-fp-x86_64.flatpak` from the
-[latest release](https://github.com/Danielnara24/img-fp/releases/latest) and
+[latest release](https://github.com/pandeyapransh911/img-fp/releases/latest) and
 install it:
 
 ```bash
@@ -85,12 +81,12 @@ The command line comes with it. To start either by its short name from a
 terminal, add these lines to `~/.bashrc` (or your shell's own file):
 
 ```bash
-alias img-fp='flatpak run --command=img-fp io.github.danielnara24.img-fp'
-alias img-fp-gui='flatpak run io.github.danielnara24.img-fp'
+alias img-fp='flatpak run --command=img-fp io.github.pandeyapransh911.img-fp'
+alias img-fp-gui='flatpak run io.github.pandeyapransh911.img-fp'
 ```
 
 The Flatpak keeps its cache, settings and last scan in
-`~/.var/app/io.github.danielnara24.img-fp/`, apart from those of an `img-fp`
+`~/.var/app/io.github.pandeyapransh911.img-fp/`, apart from those of an `img-fp`
 installed otherwise.
 
 ### Desktop app: binary
@@ -114,10 +110,10 @@ To add it to the applications menu, install the desktop entry and its icon
 from the release's extras archive (`img-fp-<version>-extras.tar.gz`):
 
 ```bash
-install -Dm644 applications/io.github.danielnara24.img-fp.desktop \
-  ~/.local/share/applications/io.github.danielnara24.img-fp.desktop
-install -Dm644 icons/io.github.danielnara24.img-fp.svg \
-  ~/.local/share/icons/hicolor/scalable/apps/io.github.danielnara24.img-fp.svg
+install -Dm644 applications/io.github.pandeyapransh911.img-fp.desktop \
+  ~/.local/share/applications/io.github.pandeyapransh911.img-fp.desktop
+install -Dm644 icons/io.github.pandeyapransh911.img-fp.svg \
+  ~/.local/share/icons/hicolor/scalable/apps/io.github.pandeyapransh911.img-fp.svg
 ```
 
 ### From source
@@ -354,7 +350,7 @@ since is answered by the rest of the library.
 
 ## Desktop app
 
-![The results of a scan: one photograph and its copies](https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/results.png)
+![The results of a scan: one photograph and its copies](https://raw.githubusercontent.com/pandeyapransh911/img-fp/main/flatpak/screenshots/results.png)
 
 `img-fp-gui` is a window over the same scan. Pick folders and options, start
 the scan, then go through the groups and choose which images to move to the
@@ -522,16 +518,3 @@ by micro average precision (µAP) on its dev set:
 img-fp is not trained on anything. SSCD is trained on DISC21's own training
 images, and with score normalization, which img-fp does not have, it reaches
 72.5 and 75.3.
-
-## License
-
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at
-your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
-
-The released binary loads the system's `libheif` (LGPL-3.0) at run time when
-it is installed; it is not bundled. The Flatpak bundles libheif and libde265 (both
-LGPL-3.0), unmodified, as shared libraries.
