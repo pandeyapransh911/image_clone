@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.danielnara24.img-fp</id>
+  <id>io.github.pandeyapransh911.img-fp</id>
   <name>img-fp</name>
   <summary>Find duplicate and near-duplicate images</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <developer id="io.github.danielnara24">
-    <name>Danielnara24</name>
+  <developer id="io.github.pandeyapransh911">
+    <name>pandeyapransh911</name>
   </developer>
 
   <description>
@@ -37,32 +37,32 @@
     <p>
       JPEG, PNG, GIF, WebP, BMP, TIFF, HEIC, AVIF, JPEG XL and more are read.
       The command-line tool is included as well:
-      flatpak run --command=img-fp io.github.danielnara24.img-fp --help
+      flatpak run --command=img-fp io.github.pandeyapransh911.img-fp --help
     </p>
   </description>
 
-  <launchable type="desktop-id">io.github.danielnara24.img-fp.desktop</launchable>
+  <launchable type="desktop-id">io.github.pandeyapransh911.img-fp.desktop</launchable>
   <provides>
     <binary>img-fp</binary>
     <binary>img-fp-gui</binary>
   </provides>
 
-  <url type="homepage">https://github.com/Danielnara24/img-fp</url>
-  <url type="bugtracker">https://github.com/Danielnara24/img-fp/issues</url>
-  <url type="vcs-browser">https://github.com/Danielnara24/img-fp</url>
+  <url type="homepage">https://github.com/pandeyapransh911/img-fp</url>
+  <url type="bugtracker">https://github.com/pandeyapransh911/img-fp/issues</url>
+  <url type="vcs-browser">https://github.com/pandeyapransh911/img-fp</url>
 
   <screenshots>
     <screenshot type="default">
       <caption>One photograph and its copies: resized, cropped, recoloured, and placed in slides</caption>
-      <image>https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/results.png</image>
+      <image>https://raw.githubusercontent.com/pandeyapransh911/img-fp/main/flatpak/screenshots/results.png</image>
     </screenshot>
     <screenshot>
       <caption>A mirrored crop beside its reference, with the part they share outlined</caption>
-      <image>https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/compare.png</image>
+      <image>https://raw.githubusercontent.com/pandeyapransh911/img-fp/main/flatpak/screenshots/compare.png</image>
     </screenshot>
     <screenshot>
       <caption>Folders and options, after a scan of 5,460 images</caption>
-      <image>https://raw.githubusercontent.com/Danielnara24/img-fp/main/flatpak/screenshots/setup.png</image>
+      <image>https://raw.githubusercontent.com/pandeyapransh911/img-fp/main/flatpak/screenshots/setup.png</image>
     </screenshot>
   </screenshots>
 
