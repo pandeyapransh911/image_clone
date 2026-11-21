@@ -12,7 +12,7 @@
 # made again whenever Cargo.lock changes:
 #
 #   python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
-id: io.github.danielnara24.img-fp
+id: io.github.pandeyapransh911.img-fp
 runtime: org.gnome.Platform
 runtime-version: '51'
 sdk: org.gnome.Sdk
